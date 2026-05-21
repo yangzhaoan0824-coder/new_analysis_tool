@@ -348,6 +348,9 @@ class EngineProcessor:
                 gs_metrics["forecast_peg_fy1"] = earnings_forecast["forecast_peg_fy1"]
             if earnings_forecast.get("forecast_roe_fy1", "N/A") != "N/A" and gs_metrics.get("forecast_roe_fy1", "N/A") == "N/A":
                 gs_metrics["forecast_roe_fy1"] = earnings_forecast["forecast_roe_fy1"]
+            # Also fill gs_metrics roe from earnings forecast if gs_metrics roe is N/A
+            if gs_metrics.get("roe") == "N/A" and earnings_forecast.get("forecast_roe_fy1", "N/A") != "N/A":
+                gs_metrics["roe"] = earnings_forecast["forecast_roe_fy1"]
 
         # ── Revenue composition ──
         revenue_comp = fetch_revenue_composition(self.ticker, self.market)
