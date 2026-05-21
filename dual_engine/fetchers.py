@@ -962,22 +962,37 @@ def fetch_company_profile(ticker: str, market: str) -> dict:
                "key_customers": "", "market_cap": "", "pe_ttm": "", "pb": ""}
     try:
         query_ticker = DataParser.to_query_ticker(ticker, market)
+
+        # ── Parallelize 4 mx-data queries ──
+        def _run_query(query: str) -> str:
+            try:
+                r = subprocess.run(["python3.12", MX_DATA_SCRIPT, query],
+                                   capture_output=True, text=True, timeout=TIMEOUT_DATA)
+                return r.stdout
+            except Exception:
+                return ""
+
+        queries = [
+            f"{query_ticker} 公司简介",
+            f"{query_ticker} 所属行业板块",
+            f"{query_ticker} 总市值 市盈率 TTM 市净率",
+            f"{query_ticker} 主营构成 收入构成 国内 海外",
+        ]
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            stdout_results = list(executor.map(_run_query, queries))
+
         # Query 1: company intro
-        try:
-            r1 = subprocess.run(["python3.12", MX_DATA_SCRIPT, f"{query_ticker} 公司简介"],
-                                capture_output=True, text=True, timeout=TIMEOUT_DATA)
-            biz_match = re.search(r"【公司简介】(.*?)(?:【|$)", r1.stdout)
+        stdout1 = stdout_results[0]
+        if stdout1:
+            biz_match = re.search(r"【公司简介】(.*?)(?:【|$)", stdout1)
             if biz_match:
                 profile["business"] = biz_match.group(1).strip()[:80]
-        except Exception:
-            pass
 
         # Query 2: industry sector
-        try:
-            r1b = subprocess.run(["python3.12", MX_DATA_SCRIPT, f"{query_ticker} 所属行业板块"],
-                                 capture_output=True, text=True, timeout=TIMEOUT_DATA)
+        stdout2 = stdout_results[1]
+        if stdout2:
             sector = None
-            for line in r1b.stdout.splitlines():
+            for line in stdout2.splitlines():
                 m = re.search(r"\|\s*[\d-]+\s+\d{2}:\d{2}\s*\|\s*([^\|\n]+)\s*\|", line)
                 if m:
                     sector = m.group(1).strip()
@@ -991,15 +1006,12 @@ def fetch_company_profile(ticker: str, market: str) -> dict:
                 profile["industry_position"] = f"{sector}行业"
             else:
                 profile["industry_position"] = "行业地位待更新"
-        except Exception:
-            pass
 
         # Query 3: market cap, PE, PB
-        try:
-            r2 = subprocess.run(["python3.12", MX_DATA_SCRIPT, f"{query_ticker} 总市值 市盈率 TTM 市净率"],
-                                capture_output=True, text=True, timeout=TIMEOUT_DATA)
+        stdout3 = stdout_results[2]
+        if stdout3:
             headers = []
-            for line in r2.stdout.splitlines():
+            for line in stdout3.splitlines():
                 if re.match(r"\|\s*date\s*\|", line, re.I):
                     headers = [p.strip() for p in line.strip().strip("|").split("|")]
                 elif re.match(r"\|\s*20\d{2}-\d{2}-\d{2}", line):
@@ -1020,19 +1032,14 @@ def fetch_company_profile(ticker: str, market: str) -> dict:
                                         if match: profile["pb"] = match.group(1)
                         if profile["market_cap"] or profile["pe_ttm"] or profile["pb"]:
                             break
-        except Exception:
-            pass
 
         # Query 4: revenue composition
-        try:
-            r3 = subprocess.run(["python3.12", MX_DATA_SCRIPT, f"{query_ticker} 主营构成 收入构成 国内 海外"],
-                                capture_output=True, text=True, timeout=TIMEOUT_DATA)
-            domestic_match = re.search(r"(?:国内|中国|境内).*?([\d.]+)%", r3.stdout)
-            overseas_match = re.search(r"(?:海外|国外|境外|国际).*?([\d.]+)%", r3.stdout)
+        stdout4 = stdout_results[3]
+        if stdout4:
+            domestic_match = re.search(r"(?:国内|中国|境内).*?([\d.]+)%", stdout4)
+            overseas_match = re.search(r"(?:海外|国外|境外|国际).*?([\d.]+)%", stdout4)
             if domestic_match or overseas_match:
                 profile["revenue_split"] = f"国内 {domestic_match.group(1) if domestic_match else 'N/A'}% | 海外 {overseas_match.group(1) if overseas_match else 'N/A'}%"
-        except Exception:
-            pass
 
         if not profile["business"]:
             profile["business"] = "主营业务数据待完善"
