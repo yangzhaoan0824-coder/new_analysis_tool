@@ -111,6 +111,115 @@ def fetch_analyst_target(ticker: str, market: str) -> str:
     return ""
 
 
+def fetch_analyst_rating(ticker: str, market: str) -> dict:
+    """Fetch consensus analyst rating from mx-data.
+
+    Returns dict with keys: rating (str), count (int), detail (str)
+    e.g. {"rating": "增持", "count": 5, "detail": "增持(5家机构)"}
+    """
+    result = {"rating": "", "count": 0, "detail": ""}
+    try:
+        query_ticker = DataParser.to_query_ticker(ticker, market)
+        query_str = f"{query_ticker} 一致预期评级 机构评级"
+        r = subprocess.run(["python3.12", MX_DATA_SCRIPT, query_str],
+                           capture_output=True, text=True, timeout=TIMEOUT_DATA)
+        headers = []
+        for line in r.stdout.splitlines():
+            if re.match(r"\|\s*date\s*\|", line, re.I):
+                headers = [p.strip() for p in line.strip().strip("|").split("|")]
+            elif re.match(r"\|\s*综合评级", line):
+                parts = [p.strip() for p in line.strip().strip("|").split("|")]
+                if len(parts) >= 2:
+                    rating_val = None
+                    for p in reversed(parts):
+                        if p and p != "-":
+                            rating_val = p
+                            break
+                    if rating_val:
+                        result["rating"] = rating_val
+            elif re.match(r"\|\s*评级机构总家数", line):
+                parts = [p.strip() for p in line.strip().strip("|").split("|")]
+                if len(parts) >= 2:
+                    for p in reversed(parts):
+                        if p and p != "-":
+                            m = re.search(r"(\d+)", p)
+                            if m:
+                                result["count"] = int(m.group(1))
+                            break
+
+        # Fallback to JSON if stdout parsing failed
+        if not result["rating"]:
+            _try_parse_rating_json(query_str, result)
+
+        if result["rating"]:
+            count_str = f"{result['count']}家机构" if result['count'] else ""
+            result["detail"] = f"{result['rating']}({count_str})" if count_str else result["rating"]
+    except Exception as e:
+        log_error("analyst_rating", str(e))
+    return result
+
+
+def _try_parse_rating_json(query_str: str, result: dict) -> None:
+    """Fallback: parse mx-data raw JSON for analyst rating."""
+    try:
+        import glob as _glob
+        safe_query = query_str.replace(" ", "_")
+        pattern = os.path.expanduser(
+            f"~/.openclaw/workspace/mx_data/output/mx_data_{safe_query}_raw.json"
+        )
+        files = _glob.glob(pattern)
+        if not files:
+            return
+        latest = max(files, key=os.path.getmtime)
+        if os.path.getmtime(latest) < time.time() - 120:
+            return
+        with open(latest, encoding="utf-8") as f:
+            raw = json.load(f)
+        d = raw
+        for _ in range(10):
+            if isinstance(d, dict) and "data" in d:
+                d = d["data"]
+            else:
+                break
+        if not isinstance(d, dict):
+            return
+        sr = d.get("searchDataResultDTO")
+        if not sr or not isinstance(sr, dict):
+            return
+        tables = sr.get("dataTableDTOList", [])
+        for tbl in tables:
+            if not isinstance(tbl, dict):
+                continue
+            name_map = tbl.get("nameMap", {})
+            tbl_data = tbl.get("table", {})
+            if not name_map or not isinstance(tbl_data, dict):
+                continue
+            head_names = tbl_data.get("headName", [])
+            if not isinstance(head_names, list):
+                continue
+            for field_key, col_name in name_map.items():
+                if field_key == "headNameSub" or not col_name:
+                    continue
+                vals = tbl_data.get(field_key, [])
+                if not isinstance(vals, list):
+                    continue
+                val = None
+                for v in reversed(vals):
+                    if v and str(v).strip() and str(v).strip() != "-":
+                        val = str(v).strip()
+                        break
+                if not val:
+                    continue
+                if "综合评级" in col_name and not result["rating"]:
+                    result["rating"] = val
+                elif "机构总家数" in col_name and not result["count"]:
+                    m = re.search(r"(\d+)", val)
+                    if m:
+                        result["count"] = int(m.group(1))
+    except Exception:
+        pass
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # News via mx-search
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -400,7 +509,7 @@ def enrich_earnings_from_mx(earnings_forecast: dict, mx_fin: dict, ticker: str) 
         if val is None: return True
         if isinstance(val, list):
             if not val: return True
-            return all(v in ("N/A", "", None) or (isinstance(v, str) and any(kw in v for kw in ["营业总", "净利润(", "归母", "EPS(", "每股"])) for v in val)
+            return all(v in ("N/A", "", None, "-") for v in val)
         return str(val) in ("N/A", "", "[]")
 
     if _is_empty(earnings_forecast.get("revenue")):
@@ -438,6 +547,90 @@ def run_weekly_check(ticker: str, market: str) -> str:
     except Exception as e:
         log_error("mx-data", f"周线数据查询失败：{e}")
         return f"mx-data 调用失败：{e}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helper: Calculate 5-day cumulative change
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _calc_5day_change(query_ticker: str) -> Optional[float]:
+    """Compute 5-day cumulative change from mx-data 区间涨跌幅.
+
+    Queries mx-data for 区间涨跌幅, reads up to 5 recent daily changes,
+    and computes cumulative return: (1+d1/100)*(1+d2/100)*...*(1+d5/100) - 1.
+    Returns percentage as float (e.g. 4.04 for +4.04%), or None on failure.
+    """
+    try:
+        r = subprocess.run(
+            ["python3.12", MX_DATA_SCRIPT, f"{query_ticker} 区间涨跌幅"],
+            capture_output=True, text=True, timeout=TIMEOUT_DATA,
+            env={**os.environ, "MX_APIKEY": os.environ.get("MX_APIKEY", "")}
+        )
+        daily_changes = []
+        for line in r.stdout.splitlines():
+            if re.match(r"\|\s*\d{4}-\d{2}-\d{2}", line):
+                parts = [p.strip() for p in line.strip().strip("|").split("|")]
+                if len(parts) >= 2:
+                    val = parts[-1]  # Last column is the change
+                    m = re.search(r"([\-\d.]+)", val)
+                    if m:
+                        daily_changes.append(float(m.group(1)))
+                if len(daily_changes) >= 5:
+                    break
+
+        if not daily_changes:
+            # Fallback: try JSON
+            query_str = f"{query_ticker} 区间涨跌幅"
+            safe_query = query_str.replace(" ", "_")
+            pattern = os.path.expanduser(
+                f"~/.openclaw/workspace/mx_data/output/mx_data_{safe_query}_raw.json"
+            )
+            import glob as _glob
+            files = _glob.glob(pattern)
+            if files:
+                latest = max(files, key=os.path.getmtime)
+                if os.path.getmtime(latest) < time.time() - 120:
+                    return None
+                with open(latest, encoding="utf-8") as f:
+                    raw = json.load(f)
+                d = raw
+                for _ in range(10):
+                    if isinstance(d, dict) and "data" in d:
+                        d = d["data"]
+                    else:
+                        break
+                if isinstance(d, dict):
+                    sr = d.get("searchDataResultDTO")
+                    if sr and isinstance(sr, dict):
+                        tables = sr.get("dataTableDTOList", [])
+                        for tbl in tables:
+                            if not isinstance(tbl, dict):
+                                continue
+                            nm = tbl.get("nameMap", {})
+                            td = tbl.get("table", {})
+                            if not nm or not isinstance(td, dict):
+                                continue
+                            # Find the 区间涨跌幅 column
+                            for fk, cn in nm.items():
+                                if "区间涨跌幅" in cn:
+                                    vals = td.get(fk, [])
+                                    if isinstance(vals, list):
+                                        for v in vals[:5]:
+                                            if v:
+                                                m = re.search(r"([\-\d.]+)", str(v))
+                                                if m:
+                                                    daily_changes.append(float(m.group(1)))
+                                    break
+
+        if len(daily_changes) >= 2:
+            # Cumulative return: product of (1 + d/100)
+            cumulative = 1.0
+            for dc in daily_changes:
+                cumulative *= (1.0 + dc / 100.0)
+            return round((cumulative - 1.0) * 100, 2)
+    except Exception:
+        pass
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -577,6 +770,10 @@ def fetch_hk_price_from_mx(ticker: str) -> Optional[dict]:
         if price_data['price'] is None:
             _try_parse_mx_json(query_str, price_data)
 
+        # If 5-day change still not available, compute from 区间涨跌幅
+        if price_data['change_5d'] is None and price_data['price'] is not None:
+            price_data['change_5d'] = _calc_5day_change(query_ticker)
+
         if price_data['price']:
             print(f"   ✅ mx-data 获取到港股实时价格：{price_data['price']} 港元")
             return price_data
@@ -596,9 +793,10 @@ def fetch_a_price_from_mx(ticker: str) -> Optional[dict]:
 
     Uses the same mx-data pipe-delimited table parsing pattern as
     fetch_hk_price_from_mx, but with A-share ticker format (e.g. 603725.SS).
+    Also calculates 5-day change from 区间涨跌幅 if available.
 
     Returns:
-        dict with keys: price, change, volume, market_cap, pe (or None on failure)
+        dict with keys: price, change, change_5d, volume, market_cap, pe (or None on failure)
     """
     try:
         # Convert ticker to mx-data query format
@@ -650,6 +848,10 @@ def fetch_a_price_from_mx(ticker: str) -> Optional[dict]:
         # Fallback: read raw JSON file if price not found in stdout
         if price_data['price'] is None:
             _try_parse_mx_json(query_str, price_data)
+
+        # If 5-day change still not available, compute from 区间涨跌幅
+        if price_data['change_5d'] is None and price_data['price'] is not None:
+            price_data['change_5d'] = _calc_5day_change(query_ticker)
 
         if price_data['price']:
             print(f"   ✅ mx-data 获取到A股实时价格：{price_data['price']} 元")
@@ -753,34 +955,83 @@ def fetch_company_profile(ticker: str, market: str) -> dict:
 
 
 def fetch_earnings_forecast(ticker: str, market: str) -> dict:
-    """Fetch analyst consensus estimates (revenue, net profit, EPS, target price)."""
+    """Fetch analyst consensus estimates (revenue, net profit, EPS, target price).
+
+    Also extracts forward metrics (PE, PEG, ROE) when available from the
+    same mx-data consensus query, so downstream code can use them to fill
+    PE(FY1) / PEG(FY1) / forecast_roe_fy1 fields.
+    """
     forecast = {"years": [], "revenue": [], "revenue_growth": [], "net_profit": [],
-                "profit_growth": [], "eps": [], "target_price": "", "analyst_count": 0, "upside": ""}
+                "profit_growth": [], "eps": [], "target_price": "", "analyst_count": 0, "upside": "",
+                "forecast_pe_fy1": "N/A", "forecast_peg_fy1": "N/A", "forecast_roe_fy1": "N/A"}
     try:
         query_ticker = DataParser.to_query_ticker(ticker, market)
-        r = subprocess.run(["python3.12", MX_DATA_SCRIPT, f"{query_ticker} 机构一致预期 2026 2027 2028"],
-                           capture_output=True, text=True, timeout=TIMEOUT_DATA)
+        query_str = f"{query_ticker} 机构一致预期 2026 2027 2028"
+
+        # Build env with MX_APIKEY (load from .zshrc if missing)
+        env = dict(os.environ)
+        if not env.get("MX_APIKEY"):
+            try:
+                with open(os.path.expanduser("~/.zshrc")) as f:
+                    for line in f:
+                        m = re.match(r'^export\s+MX_APIKEY=["\']?([^"\'\n]+)', line)
+                        if m:
+                            env["MX_APIKEY"] = m.group(1)
+                            break
+            except Exception:
+                pass
+
+        r = subprocess.run(["python3.12", MX_DATA_SCRIPT, query_str],
+                           capture_output=True, text=True, timeout=TIMEOUT_DATA, env=env)
         headers = []
         for line in r.stdout.splitlines():
             if re.match(r"\|\s*date\s*\|", line, re.I):
                 headers = [p.strip() for p in line.strip().strip("|").split("|")]
-            elif re.match(r"\|\s*[23]\d{3}[AE]?\s*\|", line):
+            elif re.match(r"\|\s*\d{4}[AE]?\s*\|", line):
                 parts = [p.strip() for p in line.strip().strip("|").split("|")]
                 if len(parts) >= 2 and headers:
                     year = parts[0]
                     if year in forecast["years"]:
                         continue
-                    revenue_val = parts[1] if len(parts) > 1 and parts[1] != "-" else None
+                    # Map columns by header names
+                    row_dict = {}
+                    for i, col in enumerate(headers):
+                        if i < len(parts):
+                            row_dict[col] = parts[i]
+
+                    revenue_val = _strip_unit(row_dict.get("营业总收入(元)") or row_dict.get("营业收入"))
+                    if revenue_val and revenue_val == "-": revenue_val = None
+
                     revenue_growth_val = None
-                    if len(parts) > 2 and parts[2] != "-":
-                        match = re.search(r"([\d.]+)", parts[2])
+                    rg_raw = row_dict.get("营业总收入增长率(%)") or row_dict.get("营收同比增长率")
+                    if rg_raw and rg_raw != "-":
+                        match = re.search(r"([\-\d.]+)", rg_raw)
                         if match: revenue_growth_val = match.group(1) + "%"
-                    profit_val = parts[3] if len(parts) > 3 and parts[3] != "-" else None
+
+                    profit_val = _strip_unit(row_dict.get("归母净利润(元)") or row_dict.get("净利润"))
+                    if profit_val and profit_val == "-": profit_val = None
+
                     profit_growth_val = None
-                    if len(parts) > 4 and parts[4] != "-":
-                        match = re.search(r"([\d.]+)", parts[4])
+                    pg_raw = row_dict.get("归母净利润增长率(%)") or row_dict.get("利润同比增长率")
+                    if pg_raw and pg_raw != "-":
+                        match = re.search(r"([\-\d.]+)", pg_raw)
                         if match: profit_growth_val = match.group(1) + "%"
-                    eps_val = parts[5] if len(parts) > 5 and parts[5] != "-" else None
+
+                    eps_val = row_dict.get("EPS(稀释)") or row_dict.get("每股收益")
+                    if eps_val and eps_val == "-": eps_val = None
+
+                    # Forward metrics from consensus table
+                    pe_val = row_dict.get("PE")
+                    peg_val = row_dict.get("PEG")
+                    roe_val = row_dict.get("ROE(摊薄)(%)") or row_dict.get("ROE(%)")
+
+                    # Only fill forecast_ fields from the latest (most recent) row
+                    if pe_val and pe_val != "-" and forecast["forecast_pe_fy1"] == "N/A":
+                        forecast["forecast_pe_fy1"] = pe_val
+                    if peg_val and peg_val != "-" and forecast["forecast_peg_fy1"] == "N/A":
+                        forecast["forecast_peg_fy1"] = peg_val
+                    if roe_val and roe_val != "-" and forecast["forecast_roe_fy1"] == "N/A":
+                        forecast["forecast_roe_fy1"] = roe_val + "%" if "%" not in roe_val else roe_val
 
                     forecast["years"].append(year)
                     forecast["revenue"].append(revenue_val or "N/A")
@@ -791,6 +1042,10 @@ def fetch_earnings_forecast(ticker: str, market: str) -> dict:
                     if len(forecast["years"]) >= 3:
                         break
 
+        # Always try JSON fallback to supplement any missing data
+        if not forecast["years"]:
+            _try_parse_earnings_json(query_str, forecast)
+
         if not forecast["years"]:
             forecast = DataParser.structure_earnings_forecast(forecast)
         elif len(forecast["years"]) < 3:
@@ -799,6 +1054,121 @@ def fetch_earnings_forecast(ticker: str, market: str) -> dict:
         log_error("earnings_forecast", str(e))
         forecast = DataParser.structure_earnings_forecast(forecast)
     return forecast
+
+
+def _strip_unit(val: str) -> str:
+    """Strip trailing unit suffix (亿/万/% etc.) from a value string.
+
+    Returns the numeric part only, e.g. '31.42亿' → '31.42', '1.209亿' → '1.21'.
+    Returns the original string if no numeric value found.
+    """
+    if not val or val == "-":
+        return val
+    m = re.search(r"([\-\d.]+)", val)
+    if m:
+        try:
+            return f"{float(m.group(1)):.2f}"
+        except ValueError:
+            return val
+    return val
+
+
+def _try_parse_earnings_json(query_str: str, forecast: dict, max_age: int = 86400) -> None:
+    """Fallback: parse mx-data raw JSON for earnings forecast data.
+
+    max_age: maximum file age in seconds (default 86400 = 24h, since
+    consensus data is not time-sensitive).
+    """
+    try:
+        import glob as _glob
+        safe_query = query_str.replace(" ", "_")
+        pattern = os.path.expanduser(
+            f"~/.openclaw/workspace/mx_data/output/mx_data_{safe_query}_raw.json"
+        )
+        files = _glob.glob(pattern)
+        if not files:
+            return
+        latest = max(files, key=os.path.getmtime)
+        if os.path.getmtime(latest) < time.time() - max_age:
+            return
+        with open(latest, encoding="utf-8") as f:
+            raw = json.load(f)
+        d = raw
+        for _ in range(10):
+            if isinstance(d, dict) and "data" in d:
+                d = d["data"]
+            else:
+                break
+        if not isinstance(d, dict):
+            return
+        sr = d.get("searchDataResultDTO")
+        if not sr or not isinstance(sr, dict):
+            return
+        tables = sr.get("dataTableDTOList", [])
+        for tbl in tables:
+            if not isinstance(tbl, dict):
+                continue
+            name_map = tbl.get("nameMap", {})
+            tbl_data = tbl.get("table", {})
+            if not name_map or not isinstance(tbl_data, dict):
+                continue
+            head_names = tbl_data.get("headName", [])
+            if not head_names:
+                continue
+            for row_idx, year in enumerate(head_names):
+                if year in forecast["years"]:
+                    continue
+                rev = _strip_unit(_json_list_val(tbl_data, name_map, row_idx, ["营业总收入(元)", "营业收入"]) or "")
+                rg = _json_list_val(tbl_data, name_map, row_idx, ["营业总收入增长率(%)", "营收同比增长率"])
+                profit = _strip_unit(_json_list_val(tbl_data, name_map, row_idx, ["归母净利润(元)", "净利润"]) or "")
+                pg = _json_list_val(tbl_data, name_map, row_idx, ["归母净利润增长率(%)", "利润同比增长率"])
+                eps = _json_list_val(tbl_data, name_map, row_idx, ["EPS(稀释)", "每股收益"])
+                pe = _json_list_val(tbl_data, name_map, row_idx, ["PE"])
+                peg = _json_list_val(tbl_data, name_map, row_idx, ["PEG"])
+                roe = _json_list_val(tbl_data, name_map, row_idx, ["ROE(摊薄)(%)", "ROE(%)"])
+
+                rg_fmt = None
+                if rg:
+                    m = re.search(r"([\-\d.]+)", rg)
+                    if m: rg_fmt = m.group(1) + "%"
+                pg_fmt = None
+                if pg:
+                    m = re.search(r"([\-\d.]+)", pg)
+                    if m: pg_fmt = m.group(1) + "%"
+
+                forecast["years"].append(year)
+                forecast["revenue"].append(rev if rev and rev != "-" else "N/A")
+                forecast["revenue_growth"].append(rg_fmt or "N/A")
+                forecast["net_profit"].append(profit if profit and profit != "-" else "N/A")
+                forecast["profit_growth"].append(pg_fmt or "N/A")
+                forecast["eps"].append(eps if eps and eps != "-" else "N/A")
+
+                if pe and forecast["forecast_pe_fy1"] == "N/A":
+                    forecast["forecast_pe_fy1"] = pe
+                if peg and forecast["forecast_peg_fy1"] == "N/A":
+                    forecast["forecast_peg_fy1"] = peg
+                if roe and forecast["forecast_roe_fy1"] == "N/A":
+                    forecast["forecast_roe_fy1"] = roe + "%" if "%" not in roe else roe
+
+                if len(forecast["years"]) >= 3:
+                    break
+    except Exception:
+        pass
+
+
+def _json_list_val(tbl_data: dict, name_map: dict, row_idx: int, col_names: list) -> str:
+    """Look up a value from mx-data JSON table by name_map column mapping."""
+    for col_name in col_names:
+        field_key = None
+        for k, v in name_map.items():
+            if v == col_name:
+                field_key = k
+                break
+        if field_key and field_key in tbl_data:
+            vals = tbl_data[field_key]
+            if isinstance(vals, list) and row_idx < len(vals) and vals[row_idx]:
+                return str(vals[row_idx])
+    return None
 
 
 def fetch_peer_comparison(ticker: str, market: str, pe_ttm: str) -> list:

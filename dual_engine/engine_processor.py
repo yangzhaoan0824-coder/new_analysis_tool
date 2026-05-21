@@ -31,7 +31,7 @@ from dual_engine.scoring import (
     generate_scenario_analysis, generate_risk_matrix,
 )
 from dual_engine.fetchers import (
-    fetch_analyst_target, fetch_news_via_mx_search, run_daily_analysis,
+    fetch_analyst_target, fetch_analyst_rating, fetch_news_via_mx_search, run_daily_analysis,
     run_trading_agents, fetch_financial_from_mx, enrich_earnings_from_mx,
     run_weekly_check, fetch_hk_price_from_mx, fetch_a_price_from_mx,
     fetch_company_profile, fetch_earnings_forecast, fetch_peer_comparison,
@@ -188,6 +188,14 @@ class EngineProcessor:
                 analyst_target = f"目标价 {tp} 评级{rating} 上涨空间{upside}%" if rating else f"目标价 {tp}"
                 consensus_rating = f"评级 {rating}" if rating else ""
 
+        # ═══ Analyst rating (mx-data consensus) ═══
+        if not consensus_rating:
+            rating_result = fetch_analyst_rating(self.ticker, self.market)
+            if rating_result["rating"]:
+                consensus_rating = f"评级 {rating_result['rating']}"
+                if not analyst_target and rating_result["detail"]:
+                    analyst_target = f"评级{rating_result['detail']}"
+
         # ═══ Current price ═══
         current_price = None
         try:
@@ -332,11 +340,33 @@ class EngineProcessor:
             if mx_financial_data.get("forecast_peg_fy1") and "forecast_peg" not in gs_metrics:
                 gs_metrics["forecast_peg_fy1"] = f"{mx_financial_data['forecast_peg_fy1']:.2f}"
 
+        # Fill forward metrics from earnings_forecast consensus data
+        if earnings_forecast:
+            if earnings_forecast.get("forecast_pe_fy1", "N/A") != "N/A" and gs_metrics.get("forecast_pe_fy1", "N/A") == "N/A":
+                gs_metrics["forecast_pe_fy1"] = earnings_forecast["forecast_pe_fy1"]
+            if earnings_forecast.get("forecast_peg_fy1", "N/A") != "N/A" and gs_metrics.get("forecast_peg_fy1", "N/A") == "N/A":
+                gs_metrics["forecast_peg_fy1"] = earnings_forecast["forecast_peg_fy1"]
+            if earnings_forecast.get("forecast_roe_fy1", "N/A") != "N/A" and gs_metrics.get("forecast_roe_fy1", "N/A") == "N/A":
+                gs_metrics["forecast_roe_fy1"] = earnings_forecast["forecast_roe_fy1"]
+
         # ── Revenue composition ──
         revenue_comp = fetch_revenue_composition(self.ticker, self.market)
 
         # ── Peer comparison ──
         peers = fetch_peer_comparison(self.ticker, self.market, pe_ttm)
+
+        # Enrich current stock's peer entry with profit growth from earnings
+        if earnings_forecast and earnings_forecast.get("profit_growth"):
+            latest_growth = None
+            for pg in reversed(earnings_forecast["profit_growth"]):
+                if pg and pg != "N/A":
+                    latest_growth = pg
+                    break
+            if latest_growth:
+                for peer in peers:
+                    if peer.get("name") == self.ticker or peer.get("note") == "当前标的":
+                        peer["profit_growth"] = latest_growth
+                        break
 
         # ── Catalysts ──
         catalysts_list = fetch_catalysts(self.ticker, self.market)
