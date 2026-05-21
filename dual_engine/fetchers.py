@@ -154,6 +154,10 @@ def fetch_analyst_rating(ticker: str, market: str) -> dict:
         if result["rating"]:
             count_str = f"{result['count']}家机构" if result['count'] else ""
             result["detail"] = f"{result['rating']}({count_str})" if count_str else result["rating"]
+
+        # Fallback to mx-search if mx-data failed
+        if not result["rating"]:
+            _fetch_rating_from_mx_search(ticker, market, result)
     except Exception as e:
         log_error("analyst_rating", str(e))
     return result
@@ -720,6 +724,42 @@ def _try_parse_mx_json(query_str: str, price_data: dict) -> None:
     except Exception:
         # Fallback parsing is best-effort; don't crash the main flow
         pass
+
+
+def _fetch_rating_from_mx_search(ticker: str, market: str, result: dict) -> None:
+    """Fallback: fetch analyst rating from mx-search when mx-data fails.
+
+    Parses individual report ratings from mx-search results to determine
+    consensus. Also extracts target price if found.
+    """
+    try:
+        query = f"{ticker} 机构评级 目标价 研报"
+        r = subprocess.run(
+            ["python3.12", MX_SEARCH_SCRIPT, query],
+            capture_output=True, text=True, timeout=TIMEOUT_NEWS,
+            env={**os.environ}
+        )
+        # Extract individual report ratings: 机构: XXX | 日期: YYYY | 类型: 研报 | 评级: 买入
+        ratings = re.findall(r'评级:\s*(买入|强烈推荐|推荐|增持|优于大市|持有|中性|减持|卖出)', r.stdout)
+        if ratings:
+            # Count each rating type and pick the most common
+            from collections import Counter
+            counter = Counter(ratings)
+            top_rating, top_count = counter.most_common(1)[0]
+            result["rating"] = top_rating
+            result["count"] = len(ratings)
+            count_str = f"{len(ratings)}家机构"
+            result["detail"] = f"{top_rating}({count_str})"
+
+        # Also try to extract target price from the same search
+        if not result.get("_target_price"):
+            tp_match = re.search(r'综合目标价[为]?(\d+\.?\d*)元', r.stdout)
+            if not tp_match:
+                tp_match = re.search(r'目标价(\d+\.?\d*)元', r.stdout)
+            if tp_match:
+                result["_target_price"] = float(tp_match.group(1))
+    except Exception as e:
+        log_error("rating_mx_search", str(e))
 
 
 def fetch_hk_price_from_mx(ticker: str) -> Optional[dict]:

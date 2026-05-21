@@ -188,12 +188,26 @@ class EngineProcessor:
                 analyst_target = f"目标价 {tp} 评级{rating} 上涨空间{upside}%" if rating else f"目标价 {tp}"
                 consensus_rating = f"评级 {rating}" if rating else ""
 
-        # ═══ Analyst rating (mx-data consensus) ═══
-        if not consensus_rating:
+        # ═══ Analyst rating + target price (mx-data, mx-search fallback) ═══
+        if not consensus_rating or not analyst_target or "目标价" not in analyst_target:
             rating_result = fetch_analyst_rating(self.ticker, self.market)
-            if rating_result["rating"]:
+            if rating_result["rating"] and not consensus_rating:
                 consensus_rating = f"评级 {rating_result['rating']}"
-                if not analyst_target and rating_result["detail"]:
+            if not analyst_target or "目标价" not in analyst_target:
+                if rating_result.get("_target_price"):
+                    tp = rating_result["_target_price"]
+                    currency = "元" if self.market != "hk" else "港元"
+                    rtg = rating_result.get("rating", consensus_rating.replace("评级 ", "") if consensus_rating else "")
+                    analyst_target = f"目标价 {tp}{currency} 评级{rtg}"
+                    cur_price = None
+                    if self.market == "a" and a_price_data and a_price_data.get('price'):
+                        cur_price = a_price_data['price']
+                    elif self.market == "hk" and hk_price_data and hk_price_data.get('price'):
+                        cur_price = hk_price_data['price']
+                    if cur_price:
+                        upside_pct = ((tp - cur_price) / cur_price) * 100
+                        analyst_target += f" 上涨空间{upside_pct:+.1f}%"
+                elif rating_result["detail"] and not analyst_target:
                     analyst_target = f"评级{rating_result['detail']}"
 
         # ═══ Current price ═══
