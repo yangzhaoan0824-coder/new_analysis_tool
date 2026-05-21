@@ -112,13 +112,14 @@ class ReportGenerator:
         ticker = self.ticker
         c = self.composite
 
-        # Tech indicators
+        # Tech indicators — prefer semantic keys (ma5, ma20, rsi, macd_diff, macd_dea)
+        # from JSON parsing; fall back to col_1/col_2/... from stdout parsing
         ti = self.results.get("tech_indicators") or getattr(r, '_latest_tech_data', {}) or {}
-        ma5 = ti.get('col_1', None)
-        ma20 = ti.get('col_2', None)
-        rsi_val = ti.get('col_5', None)
-        macd_diff = ti.get('col_3', None)
-        macd_dea = ti.get('col_4', None)
+        ma5 = ti.get('ma5', None) or ti.get('col_1', None)
+        ma20 = ti.get('ma20', None) or ti.get('col_2', None)
+        rsi_val = ti.get('rsi', None) or ti.get('col_5', None)
+        macd_diff = ti.get('macd_diff', None) or ti.get('col_3', None)
+        macd_dea = ti.get('macd_dea', None) or ti.get('col_4', None)
         macd_golden = (macd_diff > macd_dea) if (macd_diff is not None and macd_dea is not None) else None
 
         currency = "港元" if market == "hk" else "元"

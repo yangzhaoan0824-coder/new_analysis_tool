@@ -252,6 +252,99 @@ def fetch_news_via_mx_search(ticker: str, name: str = "") -> str:
 # Daily Stock Analysis
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _parse_a_tech_json(query_str: str, tech_data: dict) -> None:
+    """Parse mx-data raw JSON for A-share technical indicators.
+
+    mx-data returns multiple tables with nameMap that maps field codes to
+    human-readable names. We use nameMap to correctly identify MA5, MA20,
+    RSI, MACD columns regardless of table ordering.
+    """
+    import json as _json
+    import glob as _glob
+
+    try:
+        # Find the raw JSON output file — match loosely since mx-data
+        # preserves special chars (dots) in filenames
+        output_dir = os.path.expanduser("~/.openclaw/workspace/mx_data/output")
+        safe_prefix = re.sub(r'[\s]+', '_', query_str)
+        pattern = os.path.join(output_dir, f"mx_data_{safe_prefix}_raw.json")
+        candidates = _glob.glob(pattern)
+        # Also try with dots replaced by underscores
+        if not candidates:
+            alt_prefix = re.sub(r'[^\w]', '_', query_str)
+            pattern2 = os.path.join(output_dir, f"mx_data_{alt_prefix}_raw.json")
+            candidates = _glob.glob(pattern2)
+        if not candidates:
+            return
+
+        latest = max(candidates, key=os.path.getmtime)
+        if os.path.getmtime(latest) < time.time() - 86400:
+            return
+
+        with open(latest, "r", encoding="utf-8") as f:
+            raw = _json.load(f)
+
+        tables = (
+            raw.get("raw", raw)
+            .get("data", {})
+            .get("data", {})
+            .get("searchDataResultDTO", {})
+            .get("dataTableDTOList", [])
+        )
+        if not tables:
+            return
+
+        # Build a unified name→values map across all tables
+        for tbl in tables:
+            name_map = tbl.get("nameMap", {})
+            table = tbl.get("table", {})
+            head_names = table.get("headName", [])
+
+            # Determine the row index for the latest date
+            latest_idx = 0
+            for idx, hn in enumerate(head_names):
+                hn_str = str(hn).strip()
+                if not tech_data.get("date") or hn_str > tech_data["date"]:
+                    latest_idx = idx
+                    # Don't break — keep looking for even newer dates
+
+            # Map field codes to semantic keys using nameMap
+            for field_code, display_name in name_map.items():
+                if field_code in ("headNameSub",) or field_code == "headName":
+                    continue
+                vals = table.get(field_code, [])
+                if not vals or latest_idx >= len(vals):
+                    continue
+                val_str = str(vals[latest_idx]).strip()
+                if not val_str or val_str in ("-", "N/A"):
+                    continue
+                m = re.search(r"([\-\d.]+)", val_str)
+                if not m:
+                    continue
+                val = float(m.group(1))
+
+                # Map display_name to semantic keys
+                dn_lower = display_name.lower()
+                if "5日" in display_name or "ma5" in dn_lower or "5日ma" in dn_lower:
+                    tech_data["ma5"] = val
+                elif "20日" in display_name or "ma20" in dn_lower or "20日ma" in dn_lower:
+                    tech_data["ma20"] = val
+                elif "rsi" in dn_lower:
+                    tech_data["rsi"] = val
+                elif "dif" in dn_lower:
+                    tech_data["macd_diff"] = val
+                elif "dea" in dn_lower:
+                    tech_data["macd_dea"] = val
+
+            # Update date from headName
+            if head_names and latest_idx < len(head_names):
+                hn_str = str(head_names[latest_idx]).strip()[:10]
+                if hn_str > tech_data.get("date", ""):
+                    tech_data["date"] = hn_str
+    except Exception:
+        pass  # Best-effort; don't crash the main flow
+
+
 def run_daily_analysis(ticker: str):
     """Run daily_stock_analysis module with mx-data as priority data source."""
     import sys
@@ -299,22 +392,27 @@ def run_daily_analysis(ticker: str):
     elif market == "a":
         try:
             query_ticker = ticker + (".SS" if ticker.startswith(("6", "5")) else ".SZ")
+            query_str = f"{query_ticker} MA5 MA20 MACD RSI 技术指标 近 30 日"
             mx_result = subprocess.run(
-                ["python3.12", MX_DATA_SCRIPT, f"{query_ticker} MA5 MA20 MACD RSI 技术指标 近 30 日"],
+                ["python3.12", MX_DATA_SCRIPT, query_str],
                 capture_output=True, text=True, timeout=TIMEOUT_DATA
             )
-            for line in mx_result.stdout.splitlines():
-                if re.match(r"\|\s*20\d{2}-\d{2}-\d{2}", line):
-                    parts = [p.strip() for p in line.strip().strip("|").split("|")]
-                    if len(parts) >= 2:
-                        date = parts[0]
-                        if not latest_tech_data.get('date') or date > latest_tech_data['date']:
-                            latest_tech_data['date'] = date
-                            for i, val in enumerate(parts[1:], 1):
-                                if val and val != "-":
-                                    match = re.search(r"([\d.]+)", val)
-                                    if match:
-                                        latest_tech_data[f'col_{i}'] = float(match.group(1))
+            # Try JSON fallback first — it has proper nameMap for multi-table responses
+            _parse_a_tech_json(query_str, latest_tech_data)
+            # If JSON fallback failed, fall back to stdout parsing
+            if not latest_tech_data.get('date'):
+                for line in mx_result.stdout.splitlines():
+                    if re.match(r"\|\s*20\d{2}-\d{2}-\d{2}", line):
+                        parts = [p.strip() for p in line.strip().strip("|").split("|")]
+                        if len(parts) >= 2:
+                            date = parts[0]
+                            if not latest_tech_data.get('date') or date > latest_tech_data['date']:
+                                latest_tech_data['date'] = date
+                                for i, val in enumerate(parts[1:], 1):
+                                    if val and val != "-":
+                                        m2 = re.search(r"([\d.]+)", val)
+                                        if m2:
+                                            latest_tech_data[f'col_{i}'] = float(m2.group(1))
             if latest_tech_data.get('date'):
                 print(f"   ✅ mx-data 最新数据日期：{latest_tech_data['date']}")
                 os.environ["MX_LATEST_DATE"] = latest_tech_data['date']
@@ -376,11 +474,11 @@ def run_daily_analysis(ticker: str):
 
     # US stock score correction
     if latest_tech_data and result is not None:
-        col1 = latest_tech_data.get('col_1', 0)
-        col2 = latest_tech_data.get('col_2', 0)
-        col5 = latest_tech_data.get('col_5', 0)
-        col3 = latest_tech_data.get('col_3', 0)
-        col4 = latest_tech_data.get('col_4', 0)
+        col1 = latest_tech_data.get('ma5', 0) or latest_tech_data.get('col_1', 0)
+        col2 = latest_tech_data.get('ma20', 0) or latest_tech_data.get('col_2', 0)
+        col5 = latest_tech_data.get('rsi', 0) or latest_tech_data.get('col_5', 0)
+        col3 = latest_tech_data.get('macd_diff', 0) or latest_tech_data.get('col_3', 0)
+        col4 = latest_tech_data.get('macd_dea', 0) or latest_tech_data.get('col_4', 0)
 
         print(f"   📊 预取技术指标验证：MA5={col1}, MA20={col2}, RSI={col5}")
 
