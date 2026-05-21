@@ -856,7 +856,7 @@ def _try_parse_mx_json(query_str: str, price_data: dict) -> None:
                     continue
                 num = float(match.group(1))
                 col_lower = col_name.lower()
-                if ("最新价" in col_lower or "现价" in col_lower) and price_data['price'] is None:
+                if ("收盘价" in col_lower or "最新价" in col_lower or "现价" in col_lower) and price_data['price'] is None:
                     price_data['price'] = num
                 elif "5日" in col_lower and "涨幅" in col_lower and price_data['change_5d'] is None:
                     price_data['change_5d'] = num
@@ -922,7 +922,7 @@ def _fetch_price_from_mx(query_ticker: str, market: str) -> Optional[dict]:
     """
     err_tag = f"mx-data-{market}-price"
     try:
-        query_str = f"{query_ticker} 最新价 涨跌幅 5日涨幅 成交量 总市值 市盈率"
+        query_str = f"{query_ticker} 收盘价 涨跌幅 总市值 市盈率"
         result = subprocess.run(
             ["python3.12", MX_DATA_SCRIPT, query_str],
             capture_output=True, text=True, timeout=TIMEOUT_DATA,
@@ -944,7 +944,7 @@ def _fetch_price_from_mx(query_ticker: str, market: str) -> Optional[dict]:
                                 match = re.search(r"([\d.]+)", val)
                                 if match:
                                     num = float(match.group(1))
-                                    if ("最新价" in col or "现价" in col) and price_data['price'] is None:
+                                    if ("收盘价" in col or "最新价" in col or "现价" in col) and price_data['price'] is None:
                                         price_data['price'] = num
                                     elif "5日" in col and "涨幅" in col and price_data['change_5d'] is None:
                                         price_data['change_5d'] = num
