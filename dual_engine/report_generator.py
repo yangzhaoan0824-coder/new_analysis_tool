@@ -331,6 +331,76 @@ class ReportGenerator:
 
         change_5d_display = self.results.get("change_5d", "N/A")
 
+        # ── Catalysts table rows ──────────────────────────────────────────
+        def _display_width(s: str) -> int:
+            """Calculate terminal display width (CJK chars = 2 columns)."""
+            w = 0
+            for ch in s:
+                w += 2 if '\u4e00' <= ch <= '\u9fff' or ch in '，。！？；：''（）【】、' else 1
+            return w
+
+        def _pad_to_width(s: str, width: int) -> str:
+            """Pad string to target display width."""
+            dw = _display_width(s)
+            return s + ' ' * max(0, width - dw)
+
+        def _truncate_to_width(s: str, width: int) -> str:
+            """Truncate string to fit within target display width."""
+            result = ''
+            for ch in s:
+                cw = 2 if '\u4e00' <= ch <= '\u9fff' or ch in '，。！？；：''（）【】、' else 1
+                if _display_width(result) + cw > width:
+                    break
+                result += ch
+            return result
+
+        _catalyst_rows = ""
+        for cat in catalysts_list:
+            if "暂无明确催化剂" in cat:
+                impact, timing = "⚪ 中性", "—"
+            elif any(k in cat for k in ("重大", "50亿", "100亿")):
+                impact, timing = "🔴 重大", "近期"
+            elif any(k in cat for k in ("获得订单", "获得大单", "获得中标", "获得签约")):
+                impact, timing = "🔴 重大", "近期"
+            elif any(k in cat for k in ("订单动态", "大单动态", "中标动态", "签约动态")):
+                impact, timing = "🟡 利好", "近期"
+            elif "减持" in cat and "结束" in cat:
+                impact, timing = "🟢 利好", "已结束"
+            elif any(k in cat for k in ("回购", "增持")):
+                impact, timing = "🟢 利好", "近期"
+            else:
+                impact, timing = "🟡 利好", "近期"
+            cat_display = _pad_to_width(_truncate_to_width(cat, 24), 24)
+            _catalyst_rows += f"│ {cat_display} │ {_pad_to_width(impact, 7):7} │ {_pad_to_width(timing, 10):10} │\n"
+            _catalyst_rows += "├────────────────────────┼─────────┼────────────┤\n"
+        # Remove last separator line (should be closing border)
+        if _catalyst_rows.endswith("├────────────────────────┼─────────┼────────────┤\n"):
+            _catalyst_rows = _catalyst_rows.rstrip()
+            _catalyst_rows = _catalyst_rows[:_catalyst_rows.rfind("\n") + 1]
+
+        # ── Key events from news ──────────────────────────────────────────
+        _key_events_str = ""
+        _key_events = []
+        for line in news_text.splitlines():
+            # Match lines with date + analyst rating/report patterns
+            date_match = re.search(r"(20\d{2}[-.]\d{2}[-.]\d{2})", line)
+            if not date_match:
+                continue
+            if any(kw in line for kw in ("评级", "研报", "增持", "减持", "买入", "卖出", "推荐", "目标价")):
+                event_date = date_match.group(1).replace(".", "-")
+                # Clean the line for display
+                desc = line.strip().lstrip("- 0123456789.").strip()[:60]
+                if desc:
+                    _key_events.append(f"- {event_date}：{desc}")
+                if len(_key_events) >= 3:
+                    break
+        if _key_events:
+            _key_events_str = "\n".join(_key_events)
+        elif consensus_rating and analyst_target:
+            _key_events_str = f"- 机构评级：{consensus_rating} | {analyst_target[:50]}"
+        else:
+            _key_events_str = "- 暂无近期关键事件"
+
         # ── Industry sector score (dynamic) ──────────────────────────
         sector_score = macro_score.sector if macro_score else None
         sector_max = 30
@@ -627,6 +697,17 @@ class ReportGenerator:
 ├────────────┼────────┼───────┼──────────────────────────────┤
 │ 汇率波动   │ 🟡 中  │ 🟡 中 │ 美元收入占比高               │
 └────────────┴────────┴───────┴──────────────────────────────┘
+
+📰 短期催化剂
+
+┌────────────────────────┬─────────┬────────────┐
+│ 催化剂                 │  影响   │   时间     │
+├────────────────────────┼─────────┼────────────┤
+{_catalyst_rows}└────────────────────────┴─────────┴────────────┘
+
+**关键事件**：
+
+{_key_events_str}
 
 🎯 今日操作建议
 
