@@ -373,34 +373,63 @@ def run_daily_analysis(ticker: str):
 
     if market == "hk":
         try:
-            print(f"   📊 使用港股专用技术分析工具...")
-            hk_code = ticker.replace("HK", "").replace("hk", "")
-            hk_analyzer = os.path.join(os.path.dirname(os.path.dirname(__file__)), "hk_technical_analyzer.py")
-            result = subprocess.run(
-                ["python3.12", hk_analyzer, hk_code],
+            query_ticker = DataParser.to_query_ticker(ticker, market)  # e.g. 01316.HK
+            query_str = f"{query_ticker} MA5 MA20 MACD RSI 技术指标 近 30 日"
+            print(f"   📊 使用 mx-data 获取港股技术指标...")
+            mx_result = subprocess.run(
+                ["python3.12", MX_DATA_SCRIPT, query_str],
                 capture_output=True, text=True, timeout=TIMEOUT_DATA
             )
-            if result.returncode == 0:
-                for line in result.stdout.splitlines():
-                    if "MA5:" in line:
-                        latest_tech_data['col_1'] = float(line.split(":")[1].strip())
-                    elif "MA20:" in line:
-                        latest_tech_data['col_2'] = float(line.split(":")[1].strip())
-                    elif "RSI:" in line:
-                        latest_tech_data['col_5'] = float(line.split(":")[1].strip())
-                    elif "MACD_DIFF:" in line:
-                        latest_tech_data['col_3'] = float(line.split(":")[1].strip())
-                    elif "MACD_DEA:" in line:
-                        latest_tech_data['col_4'] = float(line.split(":")[1].strip())
-                    elif "date:" in line:
-                        latest_tech_data['date'] = line.split(":")[1].strip()
-                if latest_tech_data.get('date'):
-                    print(f"   ✅ 港股技术指标获取成功：{latest_tech_data['date']}")
-                    os.environ["MX_LATEST_DATE"] = latest_tech_data['date']
+            # Try JSON fallback first — it has proper nameMap for multi-table responses
+            _parse_a_tech_json(query_str, latest_tech_data)
+            # If JSON fallback failed, fall back to stdout parsing
+            if not latest_tech_data.get('date'):
+                for line in mx_result.stdout.splitlines():
+                    if re.match(r"\|\s*20\d{2}-\d{2}-\d{2}", line):
+                        parts = [p.strip() for p in line.strip().strip("|").split("|")]
+                        if len(parts) >= 2:
+                            date = parts[0]
+                            if not latest_tech_data.get('date') or date > latest_tech_data['date']:
+                                latest_tech_data['date'] = date
+                                for i, val in enumerate(parts[1:], 1):
+                                    if val and val != "-":
+                                        m2 = re.search(r"([\d.]+)", val)
+                                        if m2:
+                                            latest_tech_data[f'col_{i}'] = float(m2.group(1))
+            if latest_tech_data.get('date'):
+                print(f"   ✅ 港股技术指标获取成功：{latest_tech_data['date']}")
+                os.environ["MX_LATEST_DATE"] = latest_tech_data['date']
             else:
-                print(f"   ⚠️ 港股技术分析工具失败：{result.stderr[:200]}")
+                print(f"   ⚠️ 港股技术指标获取失败，尝试回退到 hk_technical_analyzer...")
+                # Fallback: try external hk_technical_analyzer.py if available
+                hk_code = ticker.replace("HK", "").replace("hk", "")
+                hk_analyzer = os.path.join(os.path.dirname(os.path.dirname(__file__)), "hk_technical_analyzer.py")
+                if os.path.isfile(hk_analyzer):
+                    result = subprocess.run(
+                        ["python3.12", hk_analyzer, hk_code],
+                        capture_output=True, text=True, timeout=TIMEOUT_DATA
+                    )
+                    if result.returncode == 0:
+                        for line in result.stdout.splitlines():
+                            if "MA5:" in line:
+                                latest_tech_data['col_1'] = float(line.split(":")[1].strip())
+                            elif "MA20:" in line:
+                                latest_tech_data['col_2'] = float(line.split(":")[1].strip())
+                            elif "RSI:" in line:
+                                latest_tech_data['col_5'] = float(line.split(":")[1].strip())
+                            elif "MACD_DIFF:" in line:
+                                latest_tech_data['col_3'] = float(line.split(":")[1].strip())
+                            elif "MACD_DEA:" in line:
+                                latest_tech_data['col_4'] = float(line.split(":")[1].strip())
+                            elif "date:" in line:
+                                latest_tech_data['date'] = line.split(":")[1].strip()
+                        if latest_tech_data.get('date'):
+                            print(f"   ✅ 港股技术指标回退获取成功：{latest_tech_data['date']}")
+                            os.environ["MX_LATEST_DATE"] = latest_tech_data['date']
+        except subprocess.TimeoutExpired:
+            print(f"   ⚠️ 港股技术指标获取超时")
         except Exception as e:
-            print(f"   ⚠️ 港股技术分析异常：{e}")
+            print(f"   ⚠️ 港股技术指标获取异常：{e}")
 
     elif market == "a":
         try:
@@ -1272,7 +1301,7 @@ def fetch_peer_comparison(ticker: str, market: str, pe_ttm: str) -> list:
     try:
         if market == "hk":
             peers = [
-                {"name": "行业平均", "code": "-", "pe": "15-20", "peg": "1.0-1.3", "note": "港股参考"},
+                {"name": "行业平均", "code": "-", "pe": "10-15", "peg": "0.8-1.2", "note": "港股参考"},
                 {"name": ticker, "code": ticker, "pe": pe_ttm if pe_ttm else "N/A", "peg": "计算中", "note": "当前标的"},
             ]
         elif market == "us":
@@ -1392,7 +1421,7 @@ def fetch_gs_financial_metrics(ticker: str, market: str) -> dict:
                     break
 
         if metrics["beta"] == "N/A":
-            metrics["beta"] = {"a": "1.15", "hk": "1.20"}.get(market, "1.10")
+            metrics["beta"] = {"a": "1.15", "hk": "1.05"}.get(market, "1.10")
 
         if metrics["debt_ratio"] != "N/A":
             match = re.search(r"([\d.]+)", metrics["debt_ratio"])
