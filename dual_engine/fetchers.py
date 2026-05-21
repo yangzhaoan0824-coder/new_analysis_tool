@@ -1334,13 +1334,27 @@ def fetch_gs_financial_metrics(ticker: str, market: str) -> dict:
                "net_debt_ebitda": "N/A", "beta": "N/A"}
     try:
         query_ticker = DataParser.to_query_ticker(ticker, market)
-        r1 = subprocess.run(["python3.12", MX_DATA_SCRIPT, f"{query_ticker} 净资产收益率 ROE 自由现金流 资产负债率"],
-                            capture_output=True, text=True, timeout=TIMEOUT_DATA)
-        r2 = subprocess.run(["python3.12", MX_DATA_SCRIPT, f"{query_ticker} Beta 系数 市盈率"],
-                            capture_output=True, text=True, timeout=TIMEOUT_DATA)
 
+        # ── Parallelize 2 mx-data queries ──
+        def _run_query(query: str) -> str:
+            try:
+                r = subprocess.run(["python3.12", MX_DATA_SCRIPT, query],
+                                   capture_output=True, text=True, timeout=TIMEOUT_DATA)
+                return r.stdout
+            except Exception:
+                return ""
+
+        queries = [
+            f"{query_ticker} 净资产收益率 ROE 自由现金流 资产负债率",
+            f"{query_ticker} Beta 系数 市盈率",
+        ]
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            stdout_results = list(executor.map(_run_query, queries))
+
+        # Parse query 1: ROE, FCF, debt ratio
+        stdout1 = stdout_results[0]
         headers1 = []
-        for line in r1.stdout.splitlines():
+        for line in stdout1.splitlines():
             if re.match(r"\|\s*date\s*\|", line, re.I):
                 headers1 = [p.strip() for p in line.strip().strip("|").split("|")]
             elif re.match(r"\|\s*20\d", line):
@@ -1357,8 +1371,10 @@ def fetch_gs_financial_metrics(ticker: str, market: str) -> dict:
                                 metrics["debt_ratio"] = parts[i]
                     break
 
+        # Parse query 2: Beta
+        stdout2 = stdout_results[1]
         headers2 = []
-        for line in r2.stdout.splitlines():
+        for line in stdout2.splitlines():
             if re.match(r"\|\s*date\s*\|", line, re.I):
                 headers2 = [p.strip() for p in line.strip().strip("|").split("|")]
             elif re.match(r"\|\s*20\d", line):
