@@ -1158,6 +1158,23 @@ class TestZeroException(unittest.TestCase):
         self.assertIsInstance(result, list)
         self.assertGreater(len(result), 0)
 
+    def test_generate_risk_matrix_hk_specific(self):
+        """HK market risk matrix must contain HK-specific risk items."""
+        result = generate_risk_matrix("HK01316", "hk")
+        self.assertIsInstance(result, list)
+        self.assertEqual(len(result), 4)
+        risk_types = [r["type"] for r in result]
+        self.assertIn("港股通资金流出", risk_types)
+        self.assertIn("做空机制风险", risk_types)
+        self.assertIn("离岸人民币波动", risk_types)
+
+    def test_generate_risk_matrix_a_share(self):
+        """A-share risk matrix must contain A-share specific risk items."""
+        result = generate_risk_matrix("603725", "a")
+        risk_types = [r["type"] for r in result]
+        self.assertIn("原材料价格波动", risk_types)
+        self.assertIn("下游需求放缓", risk_types)
+
     # ── generate_investment_thesis edge cases ──────────────────────────────
 
     def test_generate_investment_thesis_with_none_inputs(self):

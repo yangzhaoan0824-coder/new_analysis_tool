@@ -496,10 +496,25 @@ def generate_scenario_analysis(current_price, target_price, currency: str = "元
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def generate_risk_matrix(ticker: str, market: str) -> list:
-    """Generate systematic risk matrix."""
-    return [
-        {"type": "行业竞争加剧", "prob": "中", "impact": "中", "desc": "新进入者可能压缩毛利率"},
-        {"type": "原材料价格波动", "prob": "高", "impact": "中", "desc": "铜、铝等原材料涨价影响成本"},
-        {"type": "下游需求放缓", "prob": "中", "impact": "高", "desc": "汽车/家电行业增速放缓"},
-        {"type": "汇率波动", "prob": "低", "impact": "低", "desc": "出口业务受汇率影响"},
-    ]
+    """Generate systematic risk matrix tailored by market."""
+    if market == "hk":
+        return [
+            {"type": "港股通资金流出", "prob": "中", "impact": "高", "desc": "南向资金波动可能导致股价剧烈震荡"},
+            {"type": "做空机制风险", "prob": "低", "impact": "高", "desc": "港股允许做空，突发做空报告可能引发暴跌"},
+            {"type": "离岸人民币波动", "prob": "中", "impact": "中", "desc": "CNH汇率波动影响内地资金流入意愿"},
+            {"type": "港交所监管合规", "prob": "低", "impact": "中", "desc": "港交所规则变动或合规要求变化"},
+        ]
+    elif market == "us":
+        return [
+            {"type": "行业竞争加剧", "prob": "中", "impact": "中", "desc": "新进入者可能压缩毛利率"},
+            {"type": "原材料价格波动", "prob": "高", "impact": "中", "desc": "供应链成本上升影响利润率"},
+            {"type": "下游需求放缓", "prob": "中", "impact": "高", "desc": "终端市场需求增速放缓"},
+            {"type": "汇率波动", "prob": "低", "impact": "低", "desc": "海外收入受汇率影响"},
+        ]
+    else:  # A-share
+        return [
+            {"type": "行业竞争加剧", "prob": "中", "impact": "中", "desc": "新进入者可能压缩毛利率"},
+            {"type": "原材料价格波动", "prob": "高", "impact": "中", "desc": "铜、铝等原材料涨价影响成本"},
+            {"type": "下游需求放缓", "prob": "中", "impact": "高", "desc": "汽车/家电行业增速放缓"},
+            {"type": "汇率波动", "prob": "低", "impact": "低", "desc": "出口业务受汇率影响"},
+        ]
