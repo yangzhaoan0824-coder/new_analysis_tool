@@ -463,6 +463,7 @@ def run_daily_analysis(ticker: str):
 
     # Run daily_stock_analysis
     sys.path.insert(0, DAILY_ANALYSIS_DIR)
+    _orig_cwd = os.getcwd()
     os.chdir(DAILY_ANALYSIS_DIR)
 
     from dotenv import load_dotenv
@@ -541,6 +542,9 @@ def run_daily_analysis(ticker: str):
 
     if latest_tech_data:
         result._latest_tech_data = latest_tech_data
+
+    # Restore original working directory
+    os.chdir(_orig_cwd)
 
     return result
 
