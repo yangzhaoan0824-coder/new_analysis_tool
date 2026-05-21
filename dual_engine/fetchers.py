@@ -826,16 +826,30 @@ def _try_parse_mx_json(query_str: str, price_data: dict) -> None:
             tbl_data = tbl.get("table", {})
             if not name_map or not isinstance(tbl_data, dict):
                 continue
+
+            # Determine the index of the latest date from headName/headNameSub
+            # mx-data lists dates oldest-first; pick the row with the most recent date
+            head_names = tbl_data.get("headName") or tbl_data.get("headNameSub") or []
+            latest_idx = 0
+            if head_names:
+                try:
+                    latest_idx = max(range(len(head_names)),
+                                     key=lambda i: str(head_names[i]).replace("(日)", "").strip())
+                except Exception:
+                    latest_idx = 0
+
             # name_map: {"f2": "最新价", "f3": "涨跌幅", ...}
-            # tbl_data: {"f2": ["11.32"], "f3": ["4.04%"], ...}
+            # tbl_data: {"f2": ["10.68", "11.32"], "f3": ["3.72%", "4.04%"], ...}
             for field_key, col_name in name_map.items():
-                if field_key == "headNameSub":
+                if field_key in ("headNameSub", "headName"):
                     continue
                 vals = tbl_data.get(field_key)
-                if not vals or not isinstance(vals, list) or not vals[0]:
+                if not vals or not isinstance(vals, list):
                     continue
-                val = str(vals[0])
-                if val == "-" or not val:
+                # Use latest_idx; fall back to index 0 if out of range
+                row_idx = latest_idx if latest_idx < len(vals) else 0
+                val = str(vals[row_idx])
+                if not val or val == "-":
                     continue
                 match = re.search(r"([\d.]+)", val)
                 if not match:
