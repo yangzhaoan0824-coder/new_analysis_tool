@@ -439,24 +439,41 @@ def run_daily_analysis(ticker: str):
                 ["python3.12", MX_DATA_SCRIPT, query_str],
                 capture_output=True, text=True, timeout=TIMEOUT_DATA
             )
-            # Try JSON fallback first — it has proper nameMap for multi-table responses
-            _parse_a_tech_json(query_str, latest_tech_data)
-            # If JSON fallback failed, fall back to stdout parsing
-            if not latest_tech_data.get('date'):
-                for line in mx_result.stdout.splitlines():
-                    if re.match(r"\|\s*20\d{2}-\d{2}-\d{2}", line):
-                        parts = [p.strip() for p in line.strip().strip("|").split("|")]
-                        if len(parts) >= 2:
-                            date = parts[0]
-                            if not latest_tech_data.get('date') or date > latest_tech_data['date']:
-                                latest_tech_data['date'] = date
-                                for i, val in enumerate(parts[1:], 1):
-                                    if val and val != "-":
-                                        m2 = re.search(r"([\d.]+)", val)
-                                        if m2:
-                                            latest_tech_data[f'col_{i}'] = float(m2.group(1))
+            # Step 1: stdout 解析，取最新日期那行（优先）
+            # Build column name mapping from the header line
+            headers = []
+            for line in mx_result.stdout.splitlines():
+                if re.match(r"\|\s*date\s*\|", line, re.I):
+                    headers = [p.strip() for p in line.strip().strip("|").split("|")]
+                elif re.match(r"\|\s*20\d{2}-\d{2}-\d{2}", line) and headers:
+                    parts = [p.strip() for p in line.strip().strip("|").split("|")]
+                    date = parts[0] if parts else ""
+                    # Always take the latest date row
+                    if date and (not latest_tech_data.get('date') or date > latest_tech_data['date']):
+                        latest_tech_data['date'] = date
+                        for i, col in enumerate(headers[1:], 1):  # skip 'date' col
+                            if i < len(parts) and parts[i] and parts[i] != "-":
+                                m2 = re.search(r"([\-\d.]+)", parts[i])
+                                if m2:
+                                    val = float(m2.group(1))
+                                    col_lower = col.lower()
+                                    if "5日ma" in col_lower or "ma5" in col_lower or ("5日" in col and "ma" in col_lower):
+                                        latest_tech_data['ma5'] = val
+                                    elif "20日ma" in col_lower or "ma20" in col_lower or ("20日" in col and "ma" in col_lower):
+                                        latest_tech_data['ma20'] = val
+                                    elif "rsi" in col_lower:
+                                        latest_tech_data['rsi'] = val
+                                    elif "dif" in col_lower or "diff" in col_lower:
+                                        latest_tech_data['macd_diff'] = val
+                                    elif "dea" in col_lower:
+                                        latest_tech_data['macd_dea'] = val
+                                    else:
+                                        latest_tech_data[f'col_{i}'] = val
+            # Step 2: JSON 补漏缺失字段（仅当 stdout 没拿到完整数据时）
+            if not latest_tech_data.get('ma5') or not latest_tech_data.get('rsi'):
+                _parse_a_tech_json(query_str, latest_tech_data)
             if latest_tech_data.get('date'):
-                print(f"   ✅ mx-data 最新数据日期：{latest_tech_data['date']}")
+                print(f"   \u2705 mx-data 最新数据日期：{latest_tech_data['date']}")
                 os.environ["MX_LATEST_DATE"] = latest_tech_data['date']
         except subprocess.TimeoutExpired:
             print(f"   ⚠️ mx-data 预取超时")
