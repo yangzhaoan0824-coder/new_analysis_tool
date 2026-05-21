@@ -1136,6 +1136,20 @@ class TestZeroException(unittest.TestCase):
         result = generate_scenario_analysis(5.30, 0)
         self.assertIsInstance(result, list)
 
+    def test_generate_scenario_analysis_hk_currency(self):
+        """HK stock scenario analysis must use 港元 instead of 元."""
+        result = generate_scenario_analysis(5.30, 7.66, currency="港元")
+        self.assertEqual(len(result), 3)
+        for s in result:
+            self.assertIn("港元", s["target"])
+            self.assertNotIn("元", s["target"].replace("港元", ""))
+
+    def test_generate_scenario_analysis_default_currency(self):
+        """Default scenario analysis must use 元."""
+        result = generate_scenario_analysis(5.30, 7.66)
+        for s in result:
+            self.assertTrue(s["target"].endswith("元"))
+
     # ── generate_risk_matrix edge cases ────────────────────────────────────
 
     def test_generate_risk_matrix_returns_valid(self):

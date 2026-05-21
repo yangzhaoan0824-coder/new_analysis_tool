@@ -469,7 +469,7 @@ def generate_investment_thesis(ticker: str, sentiment_score: int, macro_score,
 # Scenario Analysis (Decimal precision)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def generate_scenario_analysis(current_price, target_price) -> list:
+def generate_scenario_analysis(current_price, target_price, currency: str = "元") -> list:
     """Generate bull/base/bear scenario analysis using Decimal."""
     try:
         cp = Decimal(str(current_price))
@@ -479,11 +479,11 @@ def generate_scenario_analysis(current_price, target_price) -> list:
         bear_target = tp * Decimal("0.75")
 
         scenarios = [
-            {"name": "乐观", "prob": "30%", "target": f"{float(bull_target):.1f}元",
+            {"name": "乐观", "prob": "30%", "target": f"{float(bull_target):.1f}{currency}",
              "return": f"+{float((bull_target/cp - 1)*100):.0f}%"},
-            {"name": "基准", "prob": "50%", "target": f"{float(base_target):.1f}元",
+            {"name": "基准", "prob": "50%", "target": f"{float(base_target):.1f}{currency}",
              "return": f"+{float((base_target/cp - 1)*100):.0f}%"},
-            {"name": "悲观", "prob": "20%", "target": f"{float(bear_target):.1f}元",
+            {"name": "悲观", "prob": "20%", "target": f"{float(bear_target):.1f}{currency}",
              "return": f"{float((bear_target/cp - 1)*100):.0f}%"},
         ]
         return scenarios
