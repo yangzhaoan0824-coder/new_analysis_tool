@@ -22,7 +22,7 @@ from dual_engine.constants import VERSION, ENGINE_ID, TRADING_AGENTS_DIR
 from dual_engine.exceptions import AnalysisError
 from dual_engine.utils import (
     log_error, clear_error_log, detect_market, parse_num, parse_num_float,
-    decimal_round, decimal_to_str, _load_zshrc_env
+    decimal_round, decimal_to_str, _load_zshrc_env, ERROR_LOG
 )
 from dual_engine.data_parser import DataParser
 from dual_engine.scoring import (
@@ -407,7 +407,10 @@ class EngineProcessor:
         )
 
         # ── Precision factor (Decimal-based) ──
-        precision_factor = Decimal("1.000000") - Decimal("0.000001") * len([e for e in ["N/A"] if not e])
+        # Each error in ERROR_LOG reduces precision by 0.000001
+        error_count = len(ERROR_LOG) if ERROR_LOG else 0
+        precision_factor = Decimal("1.000000") - Decimal("0.000001") * error_count
+        precision_factor = max(precision_factor, Decimal("0.000000"))
         precision_str = f"{precision_factor:.6f}"
 
         # ── Composite score (Decimal-based) ──

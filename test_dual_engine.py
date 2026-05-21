@@ -1304,6 +1304,22 @@ class TestModuleIntegration(unittest.TestCase):
         # Validate report_markdown is non-empty string
         self.assertGreater(len(report["report_markdown"]), 100)
 
+    def test_precision_factor_reflects_error_count(self):
+        """precision_factor must decrease when errors are present in ERROR_LOG."""
+        clear_error_log()
+        # No errors → precision_factor = 1.000000
+        self.assertEqual(len(ERROR_LOG), 0)
+        # Simulate 3 errors
+        log_error("test1", "error1")
+        log_error("test2", "error2")
+        log_error("test3", "error3")
+        error_count = len(ERROR_LOG)
+        from decimal import Decimal as D
+        expected_pf = D("1.000000") - D("0.000001") * error_count
+        expected_pf = max(expected_pf, D("0.000000"))
+        self.assertEqual(f"{expected_pf:.6f}", f"{0.999997:.6f}")
+        clear_error_log()
+
     def test_parse_num_float_backward_compat(self):
         """parse_num_float must produce same results as old _parse_num."""
         test_vals = [None, "N/A", "", "15.92%", "310.1亿", "abc", 42, 3.14,

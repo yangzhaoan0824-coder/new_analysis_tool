@@ -12,6 +12,7 @@ import json
 import time
 from typing import Optional
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 
 from dual_engine.constants import (
     TIMEOUT_NEWS, TIMEOUT_DATA, TIMEOUT_ANALYSIS, TIMEOUT_FINANCIAL,
@@ -21,6 +22,23 @@ from dual_engine.constants import (
 )
 from dual_engine.utils import log_error, detect_market, _load_zshrc_env
 from dual_engine.data_parser import DataParser
+
+
+def _navigate_mx_data_json(raw: dict) -> dict:
+    """Navigate the nested mx-data JSON structure to find the data dict.
+
+    mx-data raw JSON has a variable-depth nesting like:
+        raw -> data -> data -> searchDataResultDTO -> dataTableDTOList
+    This helper unwinds the nesting and returns the innermost dict
+    containing 'searchDataResultDTO', or empty dict if not found.
+    """
+    d = raw
+    for _ in range(10):
+        if isinstance(d, dict) and "data" in d:
+            d = d["data"]
+        else:
+            break
+    return d if isinstance(d, dict) else {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -179,12 +197,7 @@ def _try_parse_rating_json(query_str: str, result: dict) -> None:
             return
         with open(latest, encoding="utf-8") as f:
             raw = json.load(f)
-        d = raw
-        for _ in range(10):
-            if isinstance(d, dict) and "data" in d:
-                d = d["data"]
-            else:
-                break
+        d = _navigate_mx_data_json(raw)
         if not isinstance(d, dict):
             return
         sr = d.get("searchDataResultDTO")
@@ -695,12 +708,7 @@ def _calc_5day_change(query_ticker: str) -> Optional[float]:
                     return None
                 with open(latest, encoding="utf-8") as f:
                     raw = json.load(f)
-                d = raw
-                for _ in range(10):
-                    if isinstance(d, dict) and "data" in d:
-                        d = d["data"]
-                    else:
-                        break
+                d = _navigate_mx_data_json(raw)
                 if isinstance(d, dict):
                     sr = d.get("searchDataResultDTO")
                     if sr and isinstance(sr, dict):
@@ -769,12 +777,7 @@ def _try_parse_mx_json(query_str: str, price_data: dict) -> None:
             raw = _json.load(f)
 
         # Navigate nested data structure: raw -> data -> ... -> searchDataResultDTO
-        d = raw
-        for _ in range(10):
-            if isinstance(d, dict) and "data" in d:
-                d = d["data"]
-            else:
-                break
+        d = _navigate_mx_data_json(raw)
 
         if not isinstance(d, dict):
             return
@@ -860,14 +863,18 @@ def _fetch_rating_from_mx_search(ticker: str, market: str, result: dict) -> None
         log_error("rating_mx_search", str(e))
 
 
-def fetch_hk_price_from_mx(ticker: str) -> Optional[dict]:
-    """Fetch HK real-time price via mx-data as fallback."""
-    try:
-        if ticker.startswith("HK") and ticker[2:].isdigit():
-            query_ticker = f"{ticker[2:]}.HK"
-        else:
-            query_ticker = ticker
+def _fetch_price_from_mx(query_ticker: str, market: str) -> Optional[dict]:
+    """Shared price fetching logic for HK and A-share markets.
 
+    Args:
+        query_ticker: Ticker in mx-data format (e.g. 01316.HK, 603725.SS)
+        market: 'hk' or 'a'
+
+    Returns:
+        dict with keys: price, change, change_5d, volume, market_cap, pe (or None on failure)
+    """
+    err_tag = f"mx-data-{market}-price"
+    try:
         query_str = f"{query_ticker} 最新价 涨跌幅 5日涨幅 成交量 总市值 市盈率"
         result = subprocess.run(
             ["python3.12", MX_DATA_SCRIPT, query_str],
@@ -902,7 +909,6 @@ def fetch_hk_price_from_mx(ticker: str) -> Optional[dict]:
                                         price_data['market_cap'] = val
                                     elif ("市盈率" in col or "PE" in col.upper()) and price_data['pe'] is None:
                                         price_data['pe'] = val
-                # Don't break - continue parsing all tables for HK
 
         # Fallback: read raw JSON file if price not found in stdout
         if price_data['price'] is None:
@@ -913,13 +919,24 @@ def fetch_hk_price_from_mx(ticker: str) -> Optional[dict]:
             price_data['change_5d'] = _calc_5day_change(query_ticker)
 
         if price_data['price']:
-            print(f"   ✅ mx-data 获取到港股实时价格：{price_data['price']} 港元")
+            currency = "港元" if market == "hk" else "元"
+            label = "港股" if market == "hk" else "A股"
+            print(f"   ✅ mx-data 获取到{label}实时价格：{price_data['price']} {currency}")
             return price_data
     except subprocess.TimeoutExpired:
-        log_error("mx-data-hk-price", f"查询超时 ({TIMEOUT_DATA}秒)")
+        log_error(err_tag, f"查询超时 ({TIMEOUT_DATA}秒)")
     except Exception as e:
-        log_error("mx-data-hk-price", f"查询失败：{e}")
+        log_error(err_tag, f"查询失败：{e}")
     return None
+
+
+def fetch_hk_price_from_mx(ticker: str) -> Optional[dict]:
+    """Fetch HK real-time price via mx-data."""
+    if ticker.startswith("HK") and ticker[2:].isdigit():
+        query_ticker = f"{ticker[2:]}.HK"
+    else:
+        query_ticker = ticker
+    return _fetch_price_from_mx(query_ticker, "hk")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -927,78 +944,12 @@ def fetch_hk_price_from_mx(ticker: str) -> Optional[dict]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def fetch_a_price_from_mx(ticker: str) -> Optional[dict]:
-    """Fetch A-share real-time price via mx-data.
-
-    Uses the same mx-data pipe-delimited table parsing pattern as
-    fetch_hk_price_from_mx, but with A-share ticker format (e.g. 603725.SS).
-    Also calculates 5-day change from 区间涨跌幅 if available.
-
-    Returns:
-        dict with keys: price, change, change_5d, volume, market_cap, pe (or None on failure)
-    """
-    try:
-        # Convert ticker to mx-data query format
-        if ticker.startswith(("6", "5")):
-            query_ticker = f"{ticker}.SS"
-        else:
-            query_ticker = f"{ticker}.SZ"
-
-        query_str = f"{query_ticker} 最新价 涨跌幅 5日涨幅 成交量 总市值 市盈率"
-        result = subprocess.run(
-            ["python3.12", MX_DATA_SCRIPT, query_str],
-            capture_output=True, text=True, timeout=TIMEOUT_DATA,
-            env={**os.environ, "MX_APIKEY": os.environ.get("MX_APIKEY", "")}
-        )
-
-        price_data = {'price': None, 'change': None, 'change_5d': None, 'volume': None, 'market_cap': None, 'pe': None}
-
-        # Strategy: parse stdout first (fast path), fall back to raw JSON file
-        # if price not found (mx-data may output multiple tables and pipe
-        # buffering can truncate stdout)
-        headers = []
-        for line in result.stdout.splitlines():
-            if re.match(r"\|\s*date\s*\|", line, re.I):
-                headers = [p.strip().lower() for p in line.strip().strip("|").split("|")]
-            elif re.match(r"\|\s*\d{4}-\d{2}-\d{2}", line):
-                parts = [p.strip() for p in line.strip().strip("|").split("|")]
-                if len(parts) >= 2 and headers:
-                    for i, col in enumerate(headers):
-                        if i < len(parts):
-                            val = parts[i]
-                            if val and val != "-":
-                                match = re.search(r"([\d.]+)", val)
-                                if match:
-                                    num = float(match.group(1))
-                                    if ("最新价" in col or "现价" in col) and price_data['price'] is None:
-                                        price_data['price'] = num
-                                    elif "5日" in col and "涨幅" in col and price_data['change_5d'] is None:
-                                        price_data['change_5d'] = num
-                                    elif "涨跌幅" in col and "区间" not in col and price_data['change'] is None:
-                                        price_data['change'] = num
-                                    elif "成交量" in col and price_data['volume'] is None:
-                                        price_data['volume'] = int(num * 10000) if num > 1000 else int(num)
-                                    elif "总市值" in col and price_data['market_cap'] is None:
-                                        price_data['market_cap'] = val
-                                    elif ("市盈率" in col or "PE" in col.upper()) and price_data['pe'] is None:
-                                        price_data['pe'] = val
-                # Don't break - continue parsing all tables for A-share
-
-        # Fallback: read raw JSON file if price not found in stdout
-        if price_data['price'] is None:
-            _try_parse_mx_json(query_str, price_data)
-
-        # If 5-day change still not available, compute from 区间涨跌幅
-        if price_data['change_5d'] is None and price_data['price'] is not None:
-            price_data['change_5d'] = _calc_5day_change(query_ticker)
-
-        if price_data['price']:
-            print(f"   ✅ mx-data 获取到A股实时价格：{price_data['price']} 元")
-            return price_data
-    except subprocess.TimeoutExpired:
-        log_error("mx-data-a-price", f"查询超时 ({TIMEOUT_DATA}秒)")
-    except Exception as e:
-        log_error("mx-data-a-price", f"查询失败：{e}")
-    return None
+    """Fetch A-share real-time price via mx-data."""
+    if ticker.startswith(("6", "5")):
+        query_ticker = f"{ticker}.SS"
+    else:
+        query_ticker = f"{ticker}.SZ"
+    return _fetch_price_from_mx(query_ticker, "a")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1231,12 +1182,7 @@ def _try_parse_earnings_json(query_str: str, forecast: dict, max_age: int = 8640
             return
         with open(latest, encoding="utf-8") as f:
             raw = json.load(f)
-        d = raw
-        for _ in range(10):
-            if isinstance(d, dict) and "data" in d:
-                d = d["data"]
-            else:
-                break
+        d = _navigate_mx_data_json(raw)
         if not isinstance(d, dict):
             return
         sr = d.get("searchDataResultDTO")
@@ -1339,22 +1285,34 @@ def fetch_catalysts(ticker: str, market: str) -> list:
     catalysts = []
     try:
         keywords = ["订单", "减持", "大单", "中标", "签约", "回购", "增持"]
-        for keyword in keywords:
+
+        def _search_keyword(keyword: str) -> tuple:
+            """Search one keyword, return (keyword, stdout)."""
             try:
                 r = subprocess.run(["python3.12", MX_SEARCH_SCRIPT, f"{ticker} {keyword}"],
                                    capture_output=True, text=True, timeout=TIMEOUT_NEWS)
-                if "减持" in keyword and ("结束" in r.stdout or "完成" in r.stdout):
-                    catalysts.append(f"股东{keyword}计划已结束，抛压解除")
-                elif "订单" in keyword or "大单" in keyword or "中标" in keyword:
-                    match = re.search(r"(\d+\.?\d*)\s*(亿元|万元)", r.stdout)
-                    if match:
-                        catalysts.append(f"获得{keyword}{match.group(1)}{match.group(2)}，利好长期订单可见性")
-                elif "回购" in keyword or "增持" in keyword:
-                    catalysts.append(f"公司{keyword}，彰显管理层信心")
-                if len(catalysts) >= 5:
-                    break
+                return (keyword, r.stdout)
             except Exception:
+                return (keyword, "")
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(executor.map(_search_keyword, keywords))
+
+        for keyword, stdout in results:
+            if not stdout:
                 continue
+            if "减持" in keyword and ("结束" in stdout or "完成" in stdout):
+                catalysts.append(f"股东{keyword}计划已结束，抛压解除")
+            elif "订单" in keyword or "大单" in keyword or "中标" in keyword:
+                match = re.search(r"(\d+\.?\d*)\s*(亿元|万元)", stdout)
+                if match:
+                    catalysts.append(f"获得{keyword}{match.group(1)}{match.group(2)}，利好长期订单可见性")
+                else:
+                    catalysts.append(f"{keyword}动态，关注后续进展")
+            elif "回购" in keyword or "增持" in keyword:
+                catalysts.append(f"公司{keyword}，彰显管理层信心")
+            if len(catalysts) >= 5:
+                break
         if not catalysts:
             catalysts.append("暂无明确催化剂")
     except Exception as e:

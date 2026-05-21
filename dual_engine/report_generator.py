@@ -126,7 +126,7 @@ class ReportGenerator:
         market_label = self.results["market_label"]
 
         # Strings
-        ma5_str = f"{ma5:.3f}" if ma5 else "N/A"
+        ma5_str = f"{ma5:.2f}" if ma5 else "N/A"
         ma20_str = f"{ma20:.2f}" if ma20 else "N/A"
         rsi_str = f"{rsi_val:.2f}" if rsi_val else "N/A"
         cp = self.results.get("current_price") or 0
@@ -331,6 +331,18 @@ class ReportGenerator:
 
         change_5d_display = self.results.get("change_5d", "N/A")
 
+        # ── Industry sector score (dynamic) ──────────────────────────
+        sector_score = macro_score.sector if macro_score else None
+        sector_max = 30
+        if isinstance(sector_score, (int, float)):
+            sector_pct = sector_score / sector_max * 100
+            if sector_pct >= 80: sector_status, sector_desc = "✅ 良好", "行业高景气"
+            elif sector_pct >= 50: sector_status, sector_desc = "⚪ 中性", "行业景气中等"
+            else: sector_status, sector_desc = "⚠️ 偏弱", "行业景气偏弱"
+            sector_display = f"{sector_score}/{sector_max}"
+        else:
+            sector_status, sector_desc, sector_display = "⚪ 中性", "行业数据待更新", "N/A"
+
         # ── Dynamic interpretation strings (US2) ──────────────────────────
         # Macro: inject market change data prefix
         market_change_prefix = ""
@@ -400,7 +412,7 @@ class ReportGenerator:
 ├───────────────┼─────────┼─────────┼──────────────────────────────────────────────┤
 │ 🌏 宏观环境   │  {macro_score.macro if macro_score else 'N/A'}/50  │ ⚪ 中性 │ {macro_interp}             │
 ├───────────────┼─────────┼─────────┼──────────────────────────────────────────────┤
-│ 🏭 行业景气   │  25/30  │ ✅ 良好 │ 行业高景气                         │
+│ 🏭 行业景气   │ {sector_display:>5}  │ {sector_status} │ {sector_desc}                         │
 ├───────────────┼─────────┼─────────┼──────────────────────────────────────────────┤
 │ 🏢 个股基本面 │ {macro_score.total if macro_score else 'N/A'}/100  │ {fundamental_icon} {fundamental_status} │ {fundamental_interp}          │
 ├───────────────┼─────────┼─────────┼──────────────────────────────────────────────┤
