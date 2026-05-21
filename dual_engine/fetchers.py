@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import json
+import time
 from typing import Optional
 from datetime import datetime, timedelta
 
@@ -443,6 +444,91 @@ def run_weekly_check(ticker: str, market: str) -> str:
 # HK Real-time Price
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _try_parse_mx_json(query_str: str, price_data: dict) -> None:
+    """Fallback: parse mx-data raw JSON file when stdout parsing misses price.
+
+    mx-data may output multiple tables; pipe buffering can truncate stdout
+    so only the first table is captured.  This reads the _raw.json file that
+    mx-data writes to disk, navigates its nested structure, and extracts
+    the same price fields.
+    """
+    try:
+        import json as _json
+        import glob as _glob
+
+        # Build filename prefix from query string (same pattern mx-data uses)
+        safe_query = query_str.replace(" ", "_")
+        pattern = os.path.expanduser(
+            f"~/.openclaw/workspace/mx_data/output/mx_data_{safe_query}_raw.json"
+        )
+        files = _glob.glob(pattern)
+        if not files:
+            return
+        latest = max(files, key=os.path.getmtime)
+
+        # Only consider files modified within last 120 seconds
+        if os.path.getmtime(latest) < time.time() - 120:
+            return
+
+        with open(latest, encoding="utf-8") as f:
+            raw = _json.load(f)
+
+        # Navigate nested data structure: raw -> data -> ... -> searchDataResultDTO
+        d = raw
+        for _ in range(10):
+            if isinstance(d, dict) and "data" in d:
+                d = d["data"]
+            else:
+                break
+
+        if not isinstance(d, dict):
+            return
+        sr = d.get("searchDataResultDTO")
+        if not sr or not isinstance(sr, dict):
+            return
+        tables = sr.get("dataTableDTOList", [])
+
+        for tbl in tables:
+            if not isinstance(tbl, dict):
+                continue
+            name_map = tbl.get("nameMap", {})
+            tbl_data = tbl.get("table", {})
+            if not name_map or not isinstance(tbl_data, dict):
+                continue
+            # name_map: {"f2": "最新价", "f3": "涨跌幅", ...}
+            # tbl_data: {"f2": ["11.32"], "f3": ["4.04%"], ...}
+            for field_key, col_name in name_map.items():
+                if field_key == "headNameSub":
+                    continue
+                vals = tbl_data.get(field_key)
+                if not vals or not isinstance(vals, list) or not vals[0]:
+                    continue
+                val = str(vals[0])
+                if val == "-" or not val:
+                    continue
+                match = re.search(r"([\d.]+)", val)
+                if not match:
+                    continue
+                num = float(match.group(1))
+                col_lower = col_name.lower()
+                if ("最新价" in col_lower or "现价" in col_lower) and price_data['price'] is None:
+                    price_data['price'] = num
+                elif "5日" in col_lower and "涨幅" in col_lower and price_data['change_5d'] is None:
+                    price_data['change_5d'] = num
+                elif "涨跌幅" in col_lower and "区间" not in col_lower and price_data['change'] is None:
+                    price_data['change'] = num
+                elif "成交量" in col_lower and price_data['volume'] is None:
+                    price_data['volume'] = int(num * 10000) if num > 1000 else int(num)
+                elif "总市值" in col_lower and price_data['market_cap'] is None:
+                    price_data['market_cap'] = val
+                elif ("市盈率" in col_lower or "pe" in col_lower) and price_data['pe'] is None:
+                    price_data['pe'] = val
+
+    except Exception:
+        # Fallback parsing is best-effort; don't crash the main flow
+        pass
+
+
 def fetch_hk_price_from_mx(ticker: str) -> Optional[dict]:
     """Fetch HK real-time price via mx-data as fallback."""
     try:
@@ -451,13 +537,14 @@ def fetch_hk_price_from_mx(ticker: str) -> Optional[dict]:
         else:
             query_ticker = ticker
 
+        query_str = f"{query_ticker} 最新价 涨跌幅 5日涨幅 成交量 总市值 市盈率"
         result = subprocess.run(
-            ["python3.12", MX_DATA_SCRIPT, f"{query_ticker} 最新价 涨跌幅 成交量 总市值 市盈率"],
+            ["python3.12", MX_DATA_SCRIPT, query_str],
             capture_output=True, text=True, timeout=TIMEOUT_DATA,
             env={**os.environ, "MX_APIKEY": os.environ.get("MX_APIKEY", "")}
         )
 
-        price_data = {'price': None, 'change': None, 'volume': None, 'market_cap': None, 'pe': None}
+        price_data = {'price': None, 'change': None, 'change_5d': None, 'volume': None, 'market_cap': None, 'pe': None}
         headers = []
         for line in result.stdout.splitlines():
             if re.match(r"\|\s*date\s*\|", line, re.I):
@@ -472,17 +559,23 @@ def fetch_hk_price_from_mx(ticker: str) -> Optional[dict]:
                                 match = re.search(r"([\d.]+)", val)
                                 if match:
                                     num = float(match.group(1))
-                                    if "最新价" in col or "现价" in col:
+                                    if ("最新价" in col or "现价" in col) and price_data['price'] is None:
                                         price_data['price'] = num
-                                    elif "涨跌幅" in col:
+                                    elif "5日" in col and "涨幅" in col and price_data['change_5d'] is None:
+                                        price_data['change_5d'] = num
+                                    elif "涨跌幅" in col and "区间" not in col and price_data['change'] is None:
                                         price_data['change'] = num
-                                    elif "成交量" in col:
+                                    elif "成交量" in col and price_data['volume'] is None:
                                         price_data['volume'] = int(num * 10000) if num > 1000 else int(num)
-                                    elif "总市值" in col:
+                                    elif "总市值" in col and price_data['market_cap'] is None:
                                         price_data['market_cap'] = val
-                                    elif "市盈率" in col or "PE" in col.upper():
+                                    elif ("市盈率" in col or "PE" in col.upper()) and price_data['pe'] is None:
                                         price_data['pe'] = val
-                    break
+                # Don't break - continue parsing all tables for HK
+
+        # Fallback: read raw JSON file if price not found in stdout
+        if price_data['price'] is None:
+            _try_parse_mx_json(query_str, price_data)
 
         if price_data['price']:
             print(f"   ✅ mx-data 获取到港股实时价格：{price_data['price']} 港元")
@@ -491,6 +584,80 @@ def fetch_hk_price_from_mx(ticker: str) -> Optional[dict]:
         log_error("mx-data-hk-price", f"查询超时 ({TIMEOUT_DATA}秒)")
     except Exception as e:
         log_error("mx-data-hk-price", f"查询失败：{e}")
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# A-Share Real-time Price
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def fetch_a_price_from_mx(ticker: str) -> Optional[dict]:
+    """Fetch A-share real-time price via mx-data.
+
+    Uses the same mx-data pipe-delimited table parsing pattern as
+    fetch_hk_price_from_mx, but with A-share ticker format (e.g. 603725.SS).
+
+    Returns:
+        dict with keys: price, change, volume, market_cap, pe (or None on failure)
+    """
+    try:
+        # Convert ticker to mx-data query format
+        if ticker.startswith(("6", "5")):
+            query_ticker = f"{ticker}.SS"
+        else:
+            query_ticker = f"{ticker}.SZ"
+
+        query_str = f"{query_ticker} 最新价 涨跌幅 5日涨幅 成交量 总市值 市盈率"
+        result = subprocess.run(
+            ["python3.12", MX_DATA_SCRIPT, query_str],
+            capture_output=True, text=True, timeout=TIMEOUT_DATA,
+            env={**os.environ, "MX_APIKEY": os.environ.get("MX_APIKEY", "")}
+        )
+
+        price_data = {'price': None, 'change': None, 'change_5d': None, 'volume': None, 'market_cap': None, 'pe': None}
+
+        # Strategy: parse stdout first (fast path), fall back to raw JSON file
+        # if price not found (mx-data may output multiple tables and pipe
+        # buffering can truncate stdout)
+        headers = []
+        for line in result.stdout.splitlines():
+            if re.match(r"\|\s*date\s*\|", line, re.I):
+                headers = [p.strip().lower() for p in line.strip().strip("|").split("|")]
+            elif re.match(r"\|\s*\d{4}-\d{2}-\d{2}", line):
+                parts = [p.strip() for p in line.strip().strip("|").split("|")]
+                if len(parts) >= 2 and headers:
+                    for i, col in enumerate(headers):
+                        if i < len(parts):
+                            val = parts[i]
+                            if val and val != "-":
+                                match = re.search(r"([\d.]+)", val)
+                                if match:
+                                    num = float(match.group(1))
+                                    if ("最新价" in col or "现价" in col) and price_data['price'] is None:
+                                        price_data['price'] = num
+                                    elif "5日" in col and "涨幅" in col and price_data['change_5d'] is None:
+                                        price_data['change_5d'] = num
+                                    elif "涨跌幅" in col and "区间" not in col and price_data['change'] is None:
+                                        price_data['change'] = num
+                                    elif "成交量" in col and price_data['volume'] is None:
+                                        price_data['volume'] = int(num * 10000) if num > 1000 else int(num)
+                                    elif "总市值" in col and price_data['market_cap'] is None:
+                                        price_data['market_cap'] = val
+                                    elif ("市盈率" in col or "PE" in col.upper()) and price_data['pe'] is None:
+                                        price_data['pe'] = val
+                # Don't break - continue parsing all tables for A-share
+
+        # Fallback: read raw JSON file if price not found in stdout
+        if price_data['price'] is None:
+            _try_parse_mx_json(query_str, price_data)
+
+        if price_data['price']:
+            print(f"   ✅ mx-data 获取到A股实时价格：{price_data['price']} 元")
+            return price_data
+    except subprocess.TimeoutExpired:
+        log_error("mx-data-a-price", f"查询超时 ({TIMEOUT_DATA}秒)")
+    except Exception as e:
+        log_error("mx-data-a-price", f"查询失败：{e}")
     return None
 
 

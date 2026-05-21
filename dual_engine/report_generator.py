@@ -26,6 +26,7 @@ from decimal import Decimal
 from dual_engine.constants import VERSION, ENGINE_ID
 from dual_engine.exceptions import AnalysisError
 from dual_engine.utils import log_error, ERROR_LOG, parse_num, decimal_round
+from dual_engine.data_parser import DataParser
 
 
 class ReportGenerator:
@@ -215,8 +216,22 @@ class ReportGenerator:
         peg_display = peg_result['peg_str'] if peg_result['peg_str'] != "N/A" else "-"
         pe_ttm_display = pe_ttm if pe_ttm and pe_ttm != "N/A" else "N/A"
 
-        # GS metrics interpretations
-        roe_interp = "📈 盈利质量改善" if gs_metrics['roe'] != 'N/A' else "数据待更新"
+        # GS metrics interpretations (US4: dynamic ROE + FY1)
+        roe_raw = gs_metrics.get('roe', 'N/A')
+        fy1_roe_val = gs_metrics.get('forecast_roe_fy1', 'N/A')
+        if roe_raw != 'N/A':
+            try:
+                _roe = float(roe_raw.replace('%', ''))
+                if _roe < 5:
+                    roe_interp = f"⚠️ 偏低，FY1预测 {fy1_roe_val}" if fy1_roe_val != 'N/A' else "⚠️ 偏低"
+                elif _roe < 15:
+                    roe_interp = f"🟡 适中，FY1预测 {fy1_roe_val}" if fy1_roe_val != 'N/A' else "🟡 适中"
+                else:
+                    roe_interp = f"🟢 优秀，FY1预测 {fy1_roe_val}" if fy1_roe_val != 'N/A' else "🟢 优秀"
+            except:
+                roe_interp = "数据待更新"
+        else:
+            roe_interp = "数据待更新"
         fcf_interp = "⚠️ 现金流波动" if gs_metrics['fcf'] != 'N/A' else "数据待更新"
         debt_interp = "🟢 杠杆稳健" if gs_metrics['net_debt_ebitda'] != 'N/A' else "数据待更新"
         beta_interp = "🔵 中高波动" if gs_metrics['beta'] != 'N/A' else "🔵 中高波动 (默认值)"
@@ -226,8 +241,8 @@ class ReportGenerator:
         debt_ratio_display = debt_ratio_raw if debt_ratio_raw != 'N/A' else 'N/A'
         try:
             _dr = float(debt_ratio_raw.replace('%', '')) if debt_ratio_raw != 'N/A' else None
-            if _dr is not None and _dr <= 30: debt_ratio_interp = "🟢 低杠杆"
-            elif _dr is not None and _dr <= 50: debt_ratio_interp = "🟡 适中"
+            if _dr is not None and _dr <= 50: debt_ratio_interp = "🟢 合理，低于50%"
+            elif _dr is not None and _dr <= 70: debt_ratio_interp = "🟡 偏高"
             elif _dr is not None: debt_ratio_interp = "🔴 高杠杆"
             else: debt_ratio_interp = "数据待更新"
         except: debt_ratio_interp = "数据待更新"
@@ -241,7 +256,17 @@ class ReportGenerator:
             else: pe_interp = "数据待更新"
         except: pe_interp = "数据待更新"
 
-        # PEG interpretation
+        # PE(FY1) interpretation (US4: dynamic)
+        pe_fy1_val = gs_metrics.get('forecast_pe_fy1', 'N/A')
+        if pe_fy1_val != 'N/A':
+            try:
+                _pe_fy1 = float(pe_fy1_val)
+                if _pe_fy1 <= 15: pe_fy1_interp = "🟢 极低估值"
+                elif _pe_fy1 <= 25: pe_fy1_interp = "🟡 合理估值"
+                else: pe_fy1_interp = "🔴 估值偏高"
+            except: pe_fy1_interp = "数据待更新"
+        else:
+            pe_fy1_interp = "数据待更新"
         peg_interp = "🟢 合理" if peg_display != "-" else "数据待更新"
         if peg_display != "-":
             try:
@@ -283,22 +308,59 @@ class ReportGenerator:
             else: stop_loss_pct = "-5.1%"
         except: stop_loss_pct = "-5.1%"
 
-        # Trade logic
+        # Trade logic (US7: multi-line)
+        trade_logic_line2 = ""
         if target_price_num and current_price and upside:
             if rating in ("买入", "增持"):
-                trade_logic = f"机构目标价{upside}上行空间，估值有吸引力。技术面短期偏空反而是低吸机会"
+                trade_logic = f"机构目标价{upside}，估值有吸引力"
+                trade_logic_line2 = "技术面短期偏空反而是低吸机会"
             elif rating == "减持":
-                trade_logic = f"机构目标价{upside}上行空间，但技术面偏空。等待反转确认后再入场"
+                trade_logic = f"机构目标价{upside}，但技术面偏空"
+                trade_logic_line2 = "等待反转确认后再入场"
             else:
-                trade_logic = f"机构目标价{upside}，但多因子信号偏空。暂不建议入场"
+                trade_logic = f"机构目标价{upside}，但多因子信号偏空"
+                trade_logic_line2 = "暂不建议入场"
         else:
             trade_logic = investment_thesis if investment_thesis else "技术面信号为主，等待方向确认"
+            trade_logic_line2 = ""
 
         # ═══════════════════════════════════════════════════════════════════════
         # Build report
         # ═══════════════════════════════════════════════════════════════════════
 
-        report = f"""📈 {r.name} ({ticker}) 投资研究报告
+        change_5d_display = self.results.get("change_5d", "N/A")
+
+        # ── Dynamic interpretation strings (US2) ──────────────────────────
+        # Macro: inject market change data prefix
+        market_change_prefix = ""
+        if price_change_display and price_change_display != "N/A":
+            market_change_prefix = f"{market_label}{price_change_display}偏弱，" if tech_status == "卖出" else f"{market_label}{price_change_display}，"
+        macro_interp = f"{market_change_prefix}政策面与风险并存"
+
+        # Fundamental: inject actual ROE and FY1 forecast
+        roe_val = gs_metrics.get('roe', 'N/A')
+        fy1_roe = gs_metrics.get('forecast_roe_fy1', 'N/A')
+        if roe_val != 'N/A' and fy1_roe != 'N/A':
+            fundamental_interp = f"ROE {roe_val}偏低，但预测FY1 {fy1_roe}改善中"
+        elif roe_val != 'N/A':
+            fundamental_interp = f"ROE {roe_val}偏低拖累，但改善趋势明确"
+        else:
+            fundamental_interp = "ROE偏低拖累，但改善趋势明确"
+
+        # Tech trend: add 空头/多头 qualifier
+        tech_trend = "空头" if tech_status == "卖出" else "多头" if tech_status == "买入" else "震荡"
+
+        # ── Title with market-aware ticker hyperlink (US1) ─────────────────────
+        if market == "hk":
+            display_ticker = DataParser.to_query_ticker(ticker, market)  # e.g. 01316.HK
+            title_ticker = f"[{display_ticker}](http://{display_ticker.lower()})"
+        elif market == "a":
+            display_ticker = DataParser.to_query_ticker(ticker, market)  # e.g. 603725.SS
+            title_ticker = f"[{display_ticker}](http://{display_ticker.lower()})"
+        else:
+            title_ticker = ticker
+
+        report = f"""📈 {r.name} ({title_ticker}) 投资研究报告
 
 > 报告日期：{datetime.now().strftime('%Y年%m月%d日')} | 分析师：AI Analyst | 市场：{market_label} | 时效：本周内
 
@@ -335,13 +397,13 @@ class ReportGenerator:
 ┌───────────────┬─────────┬─────────┬──────────────────────────────────────────────┐
 │ 维度          │  得分   │  状态   │ 解读                                         │
 ├───────────────┼─────────┼─────────┼──────────────────────────────────────────────┤
-│ 🌏 宏观环境   │  {macro_score.macro if macro_score else 'N/A'}/50  │ ⚪ 中性 │ 政策面与风险并存             │
+│ 🌏 宏观环境   │  {macro_score.macro if macro_score else 'N/A'}/50  │ ⚪ 中性 │ {macro_interp}             │
 ├───────────────┼─────────┼─────────┼──────────────────────────────────────────────┤
 │ 🏭 行业景气   │  25/30  │ ✅ 良好 │ 行业高景气                         │
 ├───────────────┼─────────┼─────────┼──────────────────────────────────────────────┤
-│ 🏢 个股基本面 │ {macro_score.total if macro_score else 'N/A'}/100  │ {fundamental_icon} {fundamental_status} │ ROE偏低拖累，但改善趋势明确          │
+│ 🏢 个股基本面 │ {macro_score.total if macro_score else 'N/A'}/100  │ {fundamental_icon} {fundamental_status} │ {fundamental_interp}          │
 ├───────────────┼─────────┼─────────┼──────────────────────────────────────────────┤
-│ 📉 技术面     │ {r.sentiment_score}/100  │ {tech_icon} {tech_status} │ {tech_status}信号，日线趋势                         │
+│ 📉 技术面     │ {r.sentiment_score}/100  │ {tech_icon} {tech_status} │ {tech_status}信号，日线{tech_trend}趋势                         │
 ├───────────────┼─────────┼─────────┼──────────────────────────────────────────────┤
 │ 💰 风险收益   │ {rr_str}  │ {rr_icon} {rr_status} │ 目标价上行{upside_display}，安全边际{'充足' if rr and rr >= 2 else '不足'}                │
 ├───────────────┼─────────┼─────────┼──────────────────────────────────────────────┤
@@ -368,12 +430,12 @@ class ReportGenerator:
 │ 基本面合计 │ {fundamental_scores['基本面合计']}/100 │ {fundamental_scores['_status']['基本面合计']} │ 基本面扎实，成长性明确                     │
 └────────────┴────────┴─────────┴────────────────────────────────────────────┘
 
-置信度拆解：{confidence_detail}
+置信度拆解：{confidence_detail} | 合计 {confidence}/100 {confidence_icon}
 
 📊 财务预测与核心指标 (GS Data)
 
 ┌────────┬──────────┬──────────┬────────────┬────────────────┬────────┬─────────┬──────────┐
-│ 报告期 │ 数据状态 │ 营收(亿) │ 净利(亿)   │ 经营现金流     │ 毛利率 │ EPS(元) │ 利润增长 │
+│ 报告期 │ 数据状态 │ 营收(亿{currency}) │ 净利(亿{currency})   │ 经营现金流     │ 毛利率 │ EPS({currency}) │ 利润增长 │
 ├────────┼──────────┼──────────┼────────────┼────────────────┼────────┼─────────┼──────────┤
 """
 
@@ -397,8 +459,26 @@ class ReportGenerator:
                 report += f"│ {year}  │   {status}   │      N/A │      N/A │     N/A ✅     │  N/A   │    N/A │      N/A │\n"
 
         report += f"""└────────┴──────────┴──────────┴────────────┴────────────────┴────────┴─────────┴──────────┘
+"""
 
-高盛财务评价指标
+        # FCF estimation footnote (US8)
+        ocf = gs_metrics.get('operating_cashflow', 'N/A')
+        fcf_val = gs_metrics.get('fcf', 'N/A')
+        fcf_note = gs_metrics.get('fcf_note', '')
+        if ocf != 'N/A':
+            try:
+                ocf_float = float(str(ocf).replace('亿', '').replace('B', ''))
+                report += f"> 经营现金流估算：OCF(TTM) {ocf_float:.2f}亿{currency}"
+                if fcf_val != 'N/A':
+                    report += f" | FCF{fcf_note} {fcf_val}"
+                report += "\n"
+            except:
+                if fcf_val != 'N/A':
+                    report += f"> 自由现金流{fcf_note}：{fcf_val}\n"
+        elif fcf_val != 'N/A':
+            report += f"> 自由现金流{fcf_note}：{fcf_val}\n"
+
+        report += f"""高盛财务评价指标
 
 ┌─────────────────┬──────────┬──────────────────────┐
 │ 指标            │   数值   │ 解读                 │
@@ -409,13 +489,13 @@ class ReportGenerator:
 ├─────────────────┼──────────┼──────────────────────┤
 │ PE(TTM)         │ {pe_ttm_display:>8} │ {pe_interp} │
 ├─────────────────┼──────────┼──────────────────────┤
-│ PE(FY1)         │ {gs_metrics.get('forecast_pe_fy1', 'N/A'):>8} │ 🟢 极低估值             │
+│ PE(FY1)         │ {gs_metrics.get('forecast_pe_fy1', 'N/A'):>8} │ {pe_fy1_interp}             │
 ├─────────────────┼──────────┼──────────────────────┤
 │ PEG(FY1)        │ {gs_metrics.get('forecast_peg_fy1', peg_display):>8} │ {peg_interp} │
 ├─────────────────┼──────────┼──────────────────────┤
 │ Beta            │ {gs_metrics['beta']:>8} │ {beta_interp} │
 ├─────────────────┼──────────┼──────────────────────┤
-│ 总市值          │ {market_cap_display:>8} │ 港股中小盘              │
+│ 总市值          │ {market_cap_display:>8} │ {market_label}中小盘              │
 └─────────────────┴──────────┴──────────────────────┘
 
 📐 行业对标与估值
@@ -425,33 +505,91 @@ class ReportGenerator:
 ├──────────┼───────┼───────┼──────────┼──────────┼──────────┼──────────────────────────────────┤
 """
 
-        # Peer comparison rows
+        # Peer comparison rows (US5: correct order + PE icon + insight)
         peer_rows = []
         median_pe = "N/A"
+        industry_desc = "汽车零部件（剔除亏损）"
         for p in peers:
             if "中位数" in str(p.get("name", "")) or "行业平均" in str(p.get("name", "")) or "行业" in str(p.get("name", "")):
                 median_pe = p.get("pe", "N/A")
+                if p.get("note"): industry_desc = str(p.get("note"))
                 break
-        peer_rows.append({"name": "行业中位数", "pe": median_pe, "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "advantage": "汽车零部件（剔除亏损）"})
-        peer_rows.append({"name": r.name, "pe": actual_pe, "peg": peg_display, "roe": roe_display, "mcap": mcap_display, "growth": growth_display, "advantage": str(industry_pos)})
-        # Add a comparison peer if available
+        peer_rows.append({"name": "行业中位数", "pe": median_pe, "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "advantage": industry_desc})
+
+        # Current stock: add PE comparison icon
+        pe_compare_icon = ""
+        try:
+            _cur_pe = float(actual_pe) if actual_pe not in ("-", "N/A") else None
+            _med_pe = float(median_pe) if median_pe not in ("N/A", "—") else None
+            if _cur_pe is not None and _med_pe is not None:
+                if _cur_pe < _med_pe * 0.7: pe_compare_icon = "🟢 最低PE — "
+                elif _cur_pe < _med_pe: pe_compare_icon = "🟢 低PE — "
+                elif _cur_pe > _med_pe * 1.5: pe_compare_icon = "🔴 高PE — "
+                else: pe_compare_icon = "🟡 中等PE — "
+        except: pass
+        current_advantage = f"{pe_compare_icon}{industry_pos}" if pe_compare_icon else str(industry_pos)
+        peer_rows.append({"name": r.name, "pe": actual_pe, "peg": peg_display, "roe": roe_display, "mcap": mcap_display, "growth": growth_display, "advantage": current_advantage})
+
+        # Add a comparison peer if available (exclude self)
         for p in peers:
             pn = str(p.get("name", ""))
-            if "行业" not in pn and "中位数" not in pn and "平均" not in pn and "Sector" not in pn:
-                peer_rows.insert(1, {"name": pn, "pe": str(p.get("pe", "N/A")), "peg": str(p.get("peg", "N/A")),
-                                      "roe": "N/A", "mcap": "N/A", "growth": "N/A", "advantage": str(p.get("note", ""))})
-                break
+            pn_ticker = str(p.get("ticker", ""))
+            is_self = pn == r.name or pn == ticker or pn_ticker == ticker or "行业" in pn or "中位数" in pn or "平均" in pn or "Sector" in pn
+            if is_self:
+                continue
+            peer_note = str(p.get("note", ""))
+            peer_pe = str(p.get("pe", "N/A"))
+            peer_pe_icon = ""
+            try:
+                _ppe = float(peer_pe) if peer_pe not in ("N/A", "-") else None
+                _mpe = float(median_pe) if median_pe not in ("N/A", "—") else None
+                if _ppe is not None and _mpe is not None:
+                    if _ppe > _mpe * 1.3: peer_pe_icon = "🔴 高PE — "
+                    elif _ppe < _mpe * 0.7: peer_pe_icon = "🟢 低PE — "
+                    else: peer_pe_icon = "🟡 中PE — "
+            except: pass
+            peer_adv = f"{peer_pe_icon}{peer_note}" if peer_pe_icon else peer_note
+            peer_rows.append({"name": pn, "pe": peer_pe, "peg": str(p.get("peg", "N/A")),
+                                  "roe": "N/A", "mcap": "N/A", "growth": "N/A", "advantage": peer_adv})
+            break
 
         for i, row in enumerate(peer_rows):
             report += f"│ {row['name'][:8]:>8} │ {row['pe']:>5} │ {row['peg']:>5} │ {row.get('roe','N/A'):>8} │ {row.get('mcap','N/A'):>8} │ {row.get('growth','N/A'):>8} │ {row['advantage'][:32]} │\n"
 
+        # Peer insight summary block (US5)
+        peer_insight = ""
+        try:
+            _cur_pe = float(actual_pe) if actual_pe not in ("-", "N/A") else None
+            _med_pe = float(median_pe) if median_pe not in ("N/A", "—") else None
+            if _cur_pe is not None and _med_pe is not None and _med_pe > 0:
+                pe_ratio = _cur_pe / _med_pe
+                if pe_ratio < 0.5:
+                    peer_insight = f"> {r.name} PE {actual_pe}x 不到行业中位数的一半，"
+                elif pe_ratio < 1:
+                    peer_insight = f"> {r.name} PE {actual_pe}x 低于行业中位数，"
+                elif pe_ratio > 1.5:
+                    peer_insight = f"> {r.name} PE {actual_pe}x 显著高于行业中位数，"
+                else:
+                    peer_insight = f"> {r.name} PE {actual_pe}x 接近行业中位数，"
+                if peg_display not in ("-", "N/A"):
+                    peer_insight += f"PEG {peg_display} {'极低' if float(peg_display) < 0.5 else '偏低' if float(peg_display) < 1 else '合理'}。"
+                if growth_display not in ("N/A", "-"):
+                    peer_insight += f"利润增速 {growth_display} {'被市场低估' if pe_ratio < 1 else '需关注'}。"
+                if roe_val != 'N/A':
+                    peer_insight += f"ROE {roe_val} 是{'主要短板' if _roe < 5 else '待提升'}。"
+                    if fy1_roe_val != 'N/A':
+                        peer_insight += f"但 FY1 预测回升至 {fy1_roe_val}。"
+        except: pass
+
         report += f"""└──────────┴───────┴───────┴──────────┴──────────┴──────────┴──────────────────────────────────┘
+
+{peer_insight}
 
 📊 实时行情
 
 | 日期 | 最新价 | 涨跌幅 | 5日涨幅 | 总市值 |
 |------|--------|--------|---------|--------|
-| {datetime.now().strftime('%m-%d')} | {current_price_str} | {price_change_display} | N/A | {market_cap_display} |
+| {datetime.now().strftime('%m-%d %H:%M')} | {current_price_str} | {price_change_display} | {change_5d_display} | {market_cap_display} |
 
 📊 关键技术指标
 
@@ -470,9 +608,9 @@ class ReportGenerator:
 ├────────────┼────────┼───────┼──────────────────────────────┤
 │ 技术面偏空 │ {'🔴 高' if r.sentiment_score < 40 else '🟡 中'} │ 🟡 中 │ 技术分{r.sentiment_score}，短期承压           │
 ├────────────┼────────┼───────┼──────────────────────────────┤
-│ ROE偏低    │ 🟡 中  │ 🟡 中 │ 盈利质量待提升 │
+│ ROE偏低    │ 🟡 中  │ 🟡 中 │ {roe_val}低于行业，盈利质量待提升 │
 ├────────────┼────────┼───────┼──────────────────────────────┤
-│ 流动性风险 │ 🟡 中  │ 🟡 中 │ 中小盘股，成交偏淡           │
+│ {market_label}流动性 │ 🟡 中  │ 🟡 中 │ 中小盘股，成交偏淡           │
 ├────────────┼────────┼───────┼──────────────────────────────┤
 │ 汇率波动   │ 🟡 中  │ 🟡 中 │ 美元收入占比高               │
 └────────────┴────────┴───────┴──────────────────────────────┘
@@ -489,6 +627,7 @@ class ReportGenerator:
 │ 目标价   │ {target_mean}（{upside_display}，机构一致预期）        │
 ├──────────┼──────────────────────────────────────────┤
 │ 逻辑     │ {trade_logic} │
+│          │ {trade_logic_line2} │
 └──────────┴──────────────────────────────────────────┘
 
 ⚠️ 免责声明：本报告由 AI 生成，仅供参考，不构成投资建议。

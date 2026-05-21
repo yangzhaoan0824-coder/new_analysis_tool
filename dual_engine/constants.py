@@ -15,6 +15,7 @@ TIMEOUT_FINANCIAL = 60     # financial data fetch timeout
 
 # ── Path constants ───────────────────────────────────────────────────────────
 DAILY_ANALYSIS_DIR = os.path.expanduser("~/.openclaw/workspace/skills/daily_stock_analysis")
+TRADING_AGENTS_DIR = os.path.expanduser("~/.openclaw/workspace/skills/trading-agents")
 TRADING_AGENTS_SCRIPT = os.path.join(os.path.dirname(os.path.dirname(__file__)), "analyze.py")
 MX_DATA_SCRIPT = os.path.expanduser("~/.openclaw/skills/mx-data/mx_data.py")
 MX_SEARCH_SCRIPT = os.path.expanduser("~/.openclaw/skills/mx-search/mx_search.py")

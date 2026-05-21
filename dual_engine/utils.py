@@ -55,6 +55,8 @@ def parse_num(val, default: Decimal = Decimal("0")) -> Decimal:
         return default
     if isinstance(val, Decimal):
         return val
+    if isinstance(val, bool):
+        return Decimal("1") if val else Decimal("0")
     if isinstance(val, (int, float)):
         return Decimal(str(val))
     s = str(val).replace("%", "").replace("亿", "").replace("元", "") \

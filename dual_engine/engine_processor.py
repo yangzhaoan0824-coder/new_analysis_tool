@@ -18,7 +18,7 @@ from decimal import Decimal, getcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-from dual_engine.constants import VERSION, ENGINE_ID
+from dual_engine.constants import VERSION, ENGINE_ID, TRADING_AGENTS_DIR
 from dual_engine.exceptions import AnalysisError
 from dual_engine.utils import (
     log_error, clear_error_log, detect_market, parse_num, parse_num_float,
@@ -33,9 +33,9 @@ from dual_engine.scoring import (
 from dual_engine.fetchers import (
     fetch_analyst_target, fetch_news_via_mx_search, run_daily_analysis,
     run_trading_agents, fetch_financial_from_mx, enrich_earnings_from_mx,
-    run_weekly_check, fetch_hk_price_from_mx, fetch_company_profile,
-    fetch_earnings_forecast, fetch_peer_comparison, fetch_catalysts,
-    fetch_gs_financial_metrics, fetch_revenue_composition,
+    run_weekly_check, fetch_hk_price_from_mx, fetch_a_price_from_mx,
+    fetch_company_profile, fetch_earnings_forecast, fetch_peer_comparison,
+    fetch_catalysts, fetch_gs_financial_metrics, fetch_revenue_composition,
     save_to_investment_db, save_to_notion,
 )
 
@@ -74,6 +74,7 @@ class EngineProcessor:
 
         # HK price correction
         hk_price_data = None
+        a_price_data = None
         if self.market == "hk":
             print(f"   🔄 港股检测：使用 mx-data 获取实时价格...")
             hk_price_data = fetch_hk_price_from_mx(self.ticker)
@@ -94,6 +95,28 @@ class EngineProcessor:
                     print(f"   ✅ 已使用 mx-data 实时价格修正：{real_price} 港元")
                 except Exception as e:
                     log_error("hk-price-correction", f"修正失败：{e}")
+
+        # A-share price correction
+        elif self.market == "a":
+            print(f"   🔄 A股检测：使用 mx-data 获取实时价格...")
+            a_price_data = fetch_a_price_from_mx(self.ticker)
+            if a_price_data and a_price_data.get('price') and r and hasattr(r, 'dashboard'):
+                real_price = a_price_data['price']
+                try:
+                    d = r.dashboard if isinstance(r.dashboard, dict) else {}
+                    bp = d.get("battle_plan", {})
+                    sp = bp.get("sniper_points", {}) if isinstance(bp, dict) else {}
+                    sp['ideal_buy'] = round(real_price * 0.98, 2)
+                    sp['stop_loss'] = round(real_price * 0.95, 2)
+                    sp['take_profit'] = round(real_price * 1.05, 2)
+                    cc = d.get("core_conclusion", {})
+                    cc['one_sentence'] = f'当前价{real_price}元，实时数据'
+                    cc['time_sensitivity'] = '实时'
+                    if a_price_data.get('change'):
+                        cc['one_sentence'] += f'，涨跌幅{a_price_data["change"]}%'
+                    print(f"   ✅ 已使用 mx-data 实时价格修正：{real_price} 元")
+                except Exception as e:
+                    log_error("a-price-correction", f"修正失败：{e}")
 
         if not r:
             raise AnalysisError("engine1", f"{self.ticker} daily_stock_analysis 失败")
@@ -143,6 +166,11 @@ class EngineProcessor:
         print(f"   Step 3/5: 宏观 - 行业 - 消息面评分...")
         macro_score = None
         try:
+            # Add trading-agents directory to sys.path for macro_scorer import
+            import sys as _sys
+            _ta_dir = TRADING_AGENTS_DIR
+            if _ta_dir not in _sys.path and os.path.isdir(_ta_dir):
+                _sys.path.insert(0, _ta_dir)
             from macro_scorer import get_macro_score
             macro_score = get_macro_score(self.ticker, self.market, news_text)
             print(f"   ✅ 基本面 - 消息面分：{macro_score.total}/100")
@@ -171,17 +199,30 @@ class EngineProcessor:
                 current_price = float(buy) / 1.02
         except Exception:
             pass
+        # Override with mx-data real-time price when available
         if self.market == "hk" and hk_price_data and hk_price_data.get('price'):
             current_price = hk_price_data['price']
+        elif self.market == "a" and a_price_data and a_price_data.get('price'):
+            current_price = a_price_data['price']
 
-        # ═══ Price change / market cap ═══
+        # ═══ Price change / market cap / 5-day change ═══
         price_change_display = "N/A"
         market_cap_display = "N/A"
+        change_5d_display = "N/A"
         if self.market == "hk" and hk_price_data:
             if hk_price_data.get('change') is not None:
                 price_change_display = f"{hk_price_data['change']:+.2f}%"
             if hk_price_data.get('market_cap'):
                 market_cap_display = str(hk_price_data['market_cap'])
+            if hk_price_data.get('change_5d') is not None:
+                change_5d_display = f"{hk_price_data['change_5d']:+.2f}%"
+        elif self.market == "a" and a_price_data:
+            if a_price_data.get('change') is not None:
+                price_change_display = f"{a_price_data['change']:+.2f}%"
+            if a_price_data.get('market_cap'):
+                market_cap_display = str(a_price_data['market_cap'])
+            if a_price_data.get('change_5d') is not None:
+                change_5d_display = f"{a_price_data['change_5d']:+.2f}%"
 
         tech_indicators = getattr(r, '_latest_tech_data', None) if r else None
 
@@ -209,9 +250,11 @@ class EngineProcessor:
             "mx_financial_data": mx_financial_data,
             "price_change": price_change_display,
             "market_cap": market_cap_display,
+            "change_5d": change_5d_display,
             "consensus_rating": consensus_rating,
             "tech_indicators": tech_indicators,
             "hk_price_data": hk_price_data,
+            "a_price_data": a_price_data,
             "composite": composite_result,
             "elapsed_seconds": time.time() - start_time,
         }
