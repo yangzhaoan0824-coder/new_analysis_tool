@@ -22,7 +22,6 @@ MX_SEARCH_SCRIPT = os.path.expanduser("~/.openclaw/skills/mx-search/mx_search.py
 INVESTMENT_DB_SCRIPT = os.path.expanduser("~/.openclaw/workspace/skills/investment-db/scripts/data_warehouse.py")
 NOTION_SYNC_DIR = os.path.expanduser("~/.openclaw/workspace/skills/notion-sync")
 NOTION_INVEST_PAGE_ID = "33894e07-be3e-80d7-88c9-dcf46cea068c"
-FINANCIAL_FETCHER = Path(__file__).parent.parent / "us_financial_fetcher.py"
 
 # ── Version / metadata ───────────────────────────────────────────────────────
 VERSION = "1.0.0"

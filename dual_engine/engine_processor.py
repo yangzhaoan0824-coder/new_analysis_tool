@@ -31,8 +31,8 @@ from dual_engine.scoring import (
     generate_scenario_analysis, generate_risk_matrix,
 )
 from dual_engine.fetchers import (
-    fetch_analyst_target, fetch_analyst_rating, fetch_news_via_mx_search, run_daily_analysis,
-    run_trading_agents, fetch_financial_from_mx, enrich_earnings_from_mx,
+    fetch_analyst_consensus, fetch_news_via_mx_search, run_daily_analysis,
+    run_trading_agents,
     run_weekly_check, fetch_hk_price_from_mx, fetch_a_price_from_mx,
     fetch_company_profile, fetch_earnings_forecast, fetch_peer_comparison,
     fetch_catalysts, fetch_gs_financial_metrics, fetch_revenue_composition,
@@ -127,13 +127,16 @@ class EngineProcessor:
         print(f"   Step 2/5: 并行执行数据查询...")
         parallel_start = time.time()
 
-        mx_financial_data = fetch_financial_from_mx(self.ticker, self.market)
+        mx_financial_data = {}  # Removed: fetch_financial_from_mx (us_financial_fetcher.py doesn't exist)
+
+        # Pass price_data to avoid redundant market_cap/PE queries
+        _price_data_for_dedup = hk_price_data if self.market == "hk" else (a_price_data if self.market == "a" else None)
 
         with ThreadPoolExecutor(max_workers=5) as executor:
             futures = {
                 executor.submit(fetch_news_via_mx_search, self.ticker, r.name if hasattr(r, 'name') else ""): "news",
                 executor.submit(run_weekly_check, self.ticker, self.market): "weekly",
-                executor.submit(fetch_company_profile, self.ticker, self.market): "profile",
+                executor.submit(fetch_company_profile, self.ticker, self.market, _price_data_for_dedup): "profile",
                 executor.submit(fetch_earnings_forecast, self.ticker, self.market): "forecast",
             }
             if self.market == "us":
@@ -154,8 +157,7 @@ class EngineProcessor:
         earnings_forecast = results.get("forecast", {})
         ta_decision = results.get("ta", None)
 
-        if mx_financial_data:
-            earnings_forecast = enrich_earnings_from_mx(earnings_forecast, mx_financial_data, self.ticker)
+        # enrich_earnings_from_mx removed: mx_financial_data is always empty (us_financial_fetcher.py missing)
 
         print(f"   ✅ 并行任务完成 ({time.time()-parallel_start:.1f}秒)")
 
@@ -177,16 +179,11 @@ class EngineProcessor:
         except Exception as e:
             log_error("macro_scorer", str(e))
 
-        # ═══ Analyst target ═══
-        analyst_target = fetch_analyst_target(self.ticker, self.market)
-        consensus_rating = ""
-        tp_from_analyst_target = None
-
-        # Extract target price number from analyst_target string (e.g. "目标价均值 35.52港元")
-        if analyst_target and "目标价" in analyst_target:
-            tp_match = re.search(r"目标价[^\d]*(\d+\.?\d*)", analyst_target)
-            if tp_match:
-                tp_from_analyst_target = float(tp_match.group(1))
+        # ═══ Analyst consensus (single mx-data query: target price + rating) ═══
+        consensus = fetch_analyst_consensus(self.ticker, self.market)
+        analyst_target = consensus.get("target", "")
+        consensus_rating = f"评级 {consensus['rating']}" if consensus["rating"] else ""
+        tp_from_analyst_target = consensus.get("_target_price")
 
         if mx_financial_data:
             tp = mx_financial_data.get("target_price")
@@ -208,27 +205,23 @@ class EngineProcessor:
                 upside_pct = ((tp_val - cur_price) / cur_price) * 100
                 analyst_target += f" 上涨空间{upside_pct:+.1f}%"
 
-        # ═══ Analyst rating + target price (mx-data, mx-search fallback) ═══
+        # Fallback: if consensus didn't get target/rating, try mx-search fallback from rating_result
         if not consensus_rating or not analyst_target or "目标价" not in analyst_target:
-            rating_result = fetch_analyst_rating(self.ticker, self.market)
-            if rating_result["rating"] and not consensus_rating:
-                consensus_rating = f"评级 {rating_result['rating']}"
-            if not analyst_target or "目标价" not in analyst_target:
-                if rating_result.get("_target_price"):
-                    tp = rating_result["_target_price"]
-                    currency = "元" if self.market != "hk" else "港元"
-                    rtg = rating_result.get("rating", consensus_rating.replace("评级 ", "") if consensus_rating else "")
-                    analyst_target = f"目标价 {tp}{currency} 评级{rtg}"
-                    cur_price = None
-                    if self.market == "a" and a_price_data and a_price_data.get('price'):
-                        cur_price = a_price_data['price']
-                    elif self.market == "hk" and hk_price_data and hk_price_data.get('price'):
-                        cur_price = hk_price_data['price']
-                    if cur_price:
-                        upside_pct = ((tp - cur_price) / cur_price) * 100
-                        analyst_target += f" 上涨空间{upside_pct:+.1f}%"
-                elif rating_result["detail"] and not analyst_target:
-                    analyst_target = f"评级{rating_result['detail']}"
+            if consensus.get("_target_price") and (not analyst_target or "目标价" not in analyst_target):
+                tp = consensus["_target_price"]
+                currency = "元" if self.market != "hk" else "港元"
+                rtg = consensus.get("rating", consensus_rating.replace("评级 ", "") if consensus_rating else "")
+                analyst_target = f"目标价 {tp}{currency} 评级{rtg}"
+                cur_price = None
+                if self.market == "a" and a_price_data and a_price_data.get('price'):
+                    cur_price = a_price_data['price']
+                elif self.market == "hk" and hk_price_data and hk_price_data.get('price'):
+                    cur_price = hk_price_data['price']
+                if cur_price:
+                    upside_pct = ((tp - cur_price) / cur_price) * 100
+                    analyst_target += f" 上涨空间{upside_pct:+.1f}%"
+            elif consensus.get("detail") and not analyst_target:
+                analyst_target = f"评级{consensus['detail']}"
 
         # ═══ Current price ═══
         current_price = None
@@ -272,7 +265,7 @@ class EngineProcessor:
         composite_result = self.compute_composite_metrics(
             r, macro_score, weekly_text, analyst_target, current_price,
             company_profile, earnings_forecast, mx_financial_data,
-            news_text, ta_decision, consensus_rating
+            news_text, ta_decision, consensus_rating, _price_data_for_dedup
         )
 
         # ═══ Assemble all results ═══
@@ -307,7 +300,7 @@ class EngineProcessor:
                                    analyst_target, current_price,
                                    company_profile, earnings_forecast,
                                    mx_financial_data, news_text,
-                                   ta_decision, consensus_rating="") -> dict:
+                                   ta_decision, consensus_rating="", price_data=None) -> dict:
         """Compute all composite metrics using Decimal precision.
 
         This is the core cross-engine logic that fuses engine1 + engine2 data.
@@ -361,7 +354,7 @@ class EngineProcessor:
         weekly_conclusion = weekly_signal(weekly_text, r.operation_advice)
 
         # ── GS Financial Metrics ──
-        gs_metrics = fetch_gs_financial_metrics(self.ticker, self.market)
+        gs_metrics = fetch_gs_financial_metrics(self.ticker, self.market, price_data=price_data)
         if mx_financial_data:
             if gs_metrics.get("roe") == "N/A" and mx_financial_data.get("roe"):
                 gs_metrics["roe"] = f"{mx_financial_data['roe']:.1f}%"
@@ -389,7 +382,8 @@ class EngineProcessor:
                 gs_metrics["roe"] = earnings_forecast["forecast_roe_fy1"]
 
         # ── Revenue composition ──
-        revenue_comp = fetch_revenue_composition(self.ticker, self.market)
+        revenue_comp = fetch_revenue_composition(self.ticker, self.market,
+                                                     company_profile.get('revenue_split', '') if company_profile else "")
 
         # ── Peer comparison ──
         peers = fetch_peer_comparison(self.ticker, self.market, pe_ttm)

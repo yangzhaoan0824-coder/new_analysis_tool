@@ -17,11 +17,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dual_engine.constants import (
     TIMEOUT_NEWS, TIMEOUT_DATA, TIMEOUT_ANALYSIS, TIMEOUT_FINANCIAL,
     DAILY_ANALYSIS_DIR, TRADING_AGENTS_SCRIPT, MX_DATA_SCRIPT,
-    MX_SEARCH_SCRIPT, INVESTMENT_DB_SCRIPT, FINANCIAL_FETCHER,
+    MX_SEARCH_SCRIPT, INVESTMENT_DB_SCRIPT,
     NOTION_SYNC_DIR, NOTION_INVEST_PAGE_ID,
 )
 from dual_engine.utils import log_error, detect_market, _load_zshrc_env
 from dual_engine.data_parser import DataParser
+from dual_engine.cache import mx_data_cached, TTL_CONSENSUS, TTL_PROFILE, TTL_EARNINGS, TTL_WEEKLY, TTL_GS_METRICS
 
 
 def _navigate_mx_data_json(raw: dict) -> dict:
@@ -42,15 +43,24 @@ def _navigate_mx_data_json(raw: dict) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Analyst Target Price
+# Analyst Consensus (merged target price + rating — single mx-data query)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def fetch_analyst_target(ticker: str, market: str) -> str:
-    """Fetch analyst target price (max/mean/min). US uses FMP, A/HK use mx-data."""
-    import urllib.request, json as _json
+def fetch_analyst_consensus(ticker: str, market: str) -> dict:
+    """Fetch analyst target price AND rating in a single mx-data query.
 
-    # US: FMP price-target-summary
+    Returns dict:
+        target: str  - e.g. "目标价均值 35.52港元 | 最高 53.0港元 | 最低 26.7港元"
+        rating: str  - e.g. "买入"
+        count: int   - e.g. 10
+        detail: str  - e.g. "买入(10家机构)"
+        _target_price: float or None  - numeric target price for downstream use
+    """
+    result = {"target": "", "rating": "", "count": 0, "detail": "", "_target_price": None}
+
+    # US: FMP price-target-summary (no rating available from FMP)
     if market == "us":
+        import urllib.request, json as _json
         fmp_key = os.environ.get("FMP_API_KEY", "")
         if fmp_key:
             try:
@@ -62,11 +72,13 @@ def fetch_analyst_target(ticker: str, market: str) -> str:
                     avg = d.get("lastQuarterAvgPriceTarget") or d.get("lastYearAvgPriceTarget")
                     if avg:
                         cnt = d.get("lastQuarterCount", 0)
-                        return f"均值 ${avg:.2f}USD（近季{cnt}家机构）"
+                        result["target"] = f"目标价均值 ${avg:.2f}USD（近季{cnt}家机构）"
+                        result["_target_price"] = float(avg)
+                        return result
             except Exception:
                 pass
 
-    # A/HK/fallback: mx-data
+    # A/HK/fallback: single mx-data query for both target price and rating
     query_ticker = DataParser.to_query_ticker(ticker, market)
     env = dict(os.environ)
     env_file = os.path.join(DAILY_ANALYSIS_DIR, ".env")
@@ -81,18 +93,19 @@ def fetch_analyst_target(ticker: str, market: str) -> str:
         pass
 
     try:
-        result = subprocess.run(
-            ["python3.12", MX_DATA_SCRIPT, f"{query_ticker} 目标价最高值 目标价最低值 目标价综合值"],
-            capture_output=True, text=True, timeout=TIMEOUT_DATA, env=env
-        )
+        query_str = f"{query_ticker} 目标价最高值 目标价最低值 目标价综合值 一致预期评级 机构评级"
+        r = mx_data_cached(query_ticker, query_str, TTL_CONSENSUS, env=env, timeout=TIMEOUT_DATA)
         unit = "港元" if market == "hk" else ("元" if market == "a" else "USD")
+
+        # --- Parse stdout for target price and rating ---
+        # Target price: date-row table with 综合值/MAX/MIN columns
         headers = []
-        for line in result.stdout.splitlines():
+        for line in r.stdout.splitlines():
             if re.match(r"\|\s*date\s*\|", line, re.I):
                 headers = [p.strip() for p in line.strip().strip("|").split("|")]
                 break
 
-        for line in result.stdout.splitlines():
+        for line in r.stdout.splitlines():
             if not re.match(r"\|\s*\d{4}-\d{2}-\d{2}", line):
                 continue
             parts = [p.strip() for p in line.strip().strip("|").split("|")]
@@ -122,30 +135,16 @@ def fetch_analyst_target(ticker: str, market: str) -> str:
                     parts_out.append(f"最高 {mx}")
                 if mn and mn != avg:
                     parts_out.append(f"最低 {mn}")
-                return " | ".join(parts_out)
+                result["target"] = " | ".join(parts_out)
+                # Extract numeric target price
+                tp_match = re.search(r"目标价[^\d]*(\d+\.?\d*)", result["target"])
+                if tp_match:
+                    result["_target_price"] = float(tp_match.group(1))
             break
-    except Exception:
-        pass
-    return ""
 
-
-def fetch_analyst_rating(ticker: str, market: str) -> dict:
-    """Fetch consensus analyst rating from mx-data.
-
-    Returns dict with keys: rating (str), count (int), detail (str)
-    e.g. {"rating": "增持", "count": 5, "detail": "增持(5家机构)"}
-    """
-    result = {"rating": "", "count": 0, "detail": ""}
-    try:
-        query_ticker = DataParser.to_query_ticker(ticker, market)
-        query_str = f"{query_ticker} 一致预期评级 机构评级"
-        r = subprocess.run(["python3.12", MX_DATA_SCRIPT, query_str],
-                           capture_output=True, text=True, timeout=TIMEOUT_DATA)
-        headers = []
+        # Rating: separate line parsing (综合评级 / 评级机构总家数)
         for line in r.stdout.splitlines():
-            if re.match(r"\|\s*date\s*\|", line, re.I):
-                headers = [p.strip() for p in line.strip().strip("|").split("|")]
-            elif re.match(r"\|\s*综合评级", line):
+            if re.match(r"\|\s*综合评级", line):
                 parts = [p.strip() for p in line.strip().strip("|").split("|")]
                 if len(parts) >= 2:
                     rating_val = None
@@ -165,7 +164,7 @@ def fetch_analyst_rating(ticker: str, market: str) -> dict:
                                 result["count"] = int(m.group(1))
                             break
 
-        # Fallback to JSON if stdout parsing failed
+        # Fallback to JSON if stdout parsing missed rating
         if not result["rating"]:
             _try_parse_rating_json(query_str, result)
 
@@ -173,12 +172,29 @@ def fetch_analyst_rating(ticker: str, market: str) -> dict:
             count_str = f"{result['count']}家机构" if result['count'] else ""
             result["detail"] = f"{result['rating']}({count_str})" if count_str else result["rating"]
 
-        # Fallback to mx-search if mx-data failed
+        # Fallback to mx-search if mx-data failed for rating
         if not result["rating"]:
             _fetch_rating_from_mx_search(ticker, market, result)
+
     except Exception as e:
-        log_error("analyst_rating", str(e))
+        log_error("analyst_consensus", str(e))
+
     return result
+
+
+# Backward-compatible wrappers
+
+def fetch_analyst_target(ticker: str, market: str) -> str:
+    """Fetch analyst target price string. Wrapper around fetch_analyst_consensus."""
+    consensus = fetch_analyst_consensus(ticker, market)
+    return consensus.get("target", "")
+
+
+def fetch_analyst_rating(ticker: str, market: str) -> dict:
+    """Fetch consensus analyst rating. Wrapper around fetch_analyst_consensus."""
+    consensus = fetch_analyst_consensus(ticker, market)
+    return {"rating": consensus["rating"], "count": consensus["count"],
+            "detail": consensus["detail"], "_target_price": consensus["_target_price"]}
 
 
 def _try_parse_rating_json(query_str: str, result: dict) -> None:
@@ -630,94 +646,15 @@ def run_trading_agents(ticker: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Financial Data (mx-data)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def fetch_financial_from_mx(ticker: str, market: str) -> dict:
-    """Fetch financial data via mx-data (revenue/net profit/gross margin/ROE/EPS)."""
-    try:
-        query_ticker = DataParser.to_mx_query_ticker_hk_numeric(ticker) if market == "hk" else ticker
-
-        env = {**os.environ}
-        if not env.get("MX_APIKEY"):
-            with open(os.path.expanduser("~/.zshrc")) as f:
-                for line in f:
-                    m = re.match(r'^export\s+MX_APIKEY=["\']?([^"\'\n]+)', line)
-                    if m:
-                        env["MX_APIKEY"] = m.group(1)
-                        break
-
-        result = subprocess.run(
-            ["python3.12", str(FINANCIAL_FETCHER), query_ticker, "--json"],
-            capture_output=True, text=True, timeout=TIMEOUT_FINANCIAL, env=env
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            lines = [l for l in result.stdout.strip().splitlines() if l.strip().startswith("{")]
-            json_line = lines[-1] if lines else result.stdout.strip()
-            wrapper = json.loads(json_line)
-            fd = wrapper.get("financial_data", {})
-            if fd and any(fd.values()):
-                print(f"   ✅ mx-data 财务数据获取成功 ({market})")
-                return fd
-    except subprocess.TimeoutExpired:
-        log_error("financial-mx", "超时 (60秒)")
-    except Exception as e:
-        log_error("financial-mx", str(e))
-    return {}
-
-
-def enrich_earnings_from_mx(earnings_forecast: dict, mx_fin: dict, ticker: str) -> dict:
-    """Enrich earnings_forecast with mx-data wide query data."""
-    if not earnings_forecast:
-        earnings_forecast = {}
-
-    existing_years = earnings_forecast.get("years")
-    if not existing_years or all(str(y) in ("N/A", "") for y in existing_years):
-        earnings_forecast["years"] = ["2025A", "2026E", "2027E"]
-
-    rev = mx_fin.get("revenue")
-    np_val = mx_fin.get("net_profit")
-    eps = mx_fin.get("eps")
-    rev_fy1 = mx_fin.get("forecast_revenue_fy1")
-    rev_fy2 = mx_fin.get("forecast_revenue_fy2")
-    np_fy1 = mx_fin.get("forecast_net_profit_fy1")
-    np_fy2 = mx_fin.get("forecast_net_profit_fy2")
-    eps_fy1 = mx_fin.get("forecast_eps_fy1")
-    eps_fy2 = mx_fin.get("forecast_eps_fy2")
-
-    def _is_empty(val):
-        if val is None: return True
-        if isinstance(val, list):
-            if not val: return True
-            return all(v in ("N/A", "", None, "-") for v in val)
-        return str(val) in ("N/A", "", "[]")
-
-    if _is_empty(earnings_forecast.get("revenue")):
-        earnings_forecast["revenue"] = [f"{rev:.2f}" if rev else "N/A", f"{rev_fy1:.2f}" if rev_fy1 else "N/A", f"{rev_fy2:.2f}" if rev_fy2 else "N/A"]
-    if _is_empty(earnings_forecast.get("net_profit")):
-        earnings_forecast["net_profit"] = [f"{np_val:.2f}" if np_val else "N/A", f"{np_fy1:.2f}" if np_fy1 else "N/A", f"{np_fy2:.2f}" if np_fy2 else "N/A"]
-    if _is_empty(earnings_forecast.get("eps")):
-        earnings_forecast["eps"] = [f"{eps:.2f}" if eps else "N/A", f"{eps_fy1:.2f}" if eps_fy1 else "N/A", f"{eps_fy2:.2f}" if eps_fy2 else "N/A"]
-    if _is_empty(earnings_forecast.get("profit_growth")):
-        earnings_forecast["profit_growth"] = ["N/A", "N/A", "N/A"]
-
-    earnings_forecast["_mx_financial"] = mx_fin
-    return earnings_forecast
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # Weekly Check
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run_weekly_check(ticker: str, market: str) -> str:
     """Run weekly trend check via mx-data."""
-    query = f"{ticker} 历史股价 近半年 成交量"
+    query_ticker = DataParser.to_query_ticker(ticker, market)
+    query = f"{query_ticker} 历史股价 近半年 成交量"
     try:
-        result = subprocess.run(
-            ["python3.12", MX_DATA_SCRIPT, query],
-            capture_output=True, text=True, timeout=TIMEOUT_DATA,
-            env={**os.environ, "MX_APIKEY": os.environ.get("MX_APIKEY", "")}
-        )
+        result = mx_data_cached(query_ticker, query, TTL_WEEKLY, timeout=TIMEOUT_DATA)
         output = result.stdout.strip()
         lines = [l for l in output.splitlines() if l.strip()]
         return "\n".join(lines[-10:]) if lines else "mx-data 无返回"
@@ -954,7 +891,7 @@ def _fetch_price_from_mx(query_ticker: str, market: str) -> Optional[dict]:
     """
     err_tag = f"mx-data-{market}-price"
     try:
-        query_str = f"{query_ticker} 最新价 涨跌幅 总市值 市盈率"
+        query_str = f"{query_ticker} 最新价 涨跌幅 5日涨幅 总市值 市盈率"
         result = subprocess.run(
             ["python3.12", MX_DATA_SCRIPT, query_str],
             capture_output=True, text=True, timeout=TIMEOUT_DATA,
@@ -1035,18 +972,30 @@ def fetch_a_price_from_mx(ticker: str) -> Optional[dict]:
 # Company Profile, Earnings, Peers, Catalysts, GS Metrics
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def fetch_company_profile(ticker: str, market: str) -> dict:
-    """Fetch company business overview, industry position, etc."""
+def fetch_company_profile(ticker: str, market: str, price_data: dict = None) -> dict:
+    """Fetch company business overview, industry position, etc.
+
+    Args:
+        price_data: Optional dict from _fetch_price_from_mx with keys market_cap, pe.
+                    If provided, skips the '总市值 市盈率' mx-data query.
+    """
     profile = {"business": "", "industry_position": "", "revenue_split": "",
                "key_customers": "", "market_cap": "", "pe_ttm": "", "pb": ""}
+
+    # Pre-fill from price_data if available (saves 1 mx-data query)
+    if price_data:
+        if price_data.get('market_cap'):
+            profile['market_cap'] = str(price_data['market_cap'])
+        if price_data.get('pe'):
+            profile['pe_ttm'] = price_data['pe']
+
     try:
         query_ticker = DataParser.to_query_ticker(ticker, market)
 
         # ── Parallelize 4 mx-data queries ──
         def _run_query(query: str) -> str:
             try:
-                r = subprocess.run(["python3.12", MX_DATA_SCRIPT, query],
-                                   capture_output=True, text=True, timeout=TIMEOUT_DATA)
+                r = mx_data_cached(query_ticker, query, TTL_PROFILE, timeout=TIMEOUT_DATA)
                 return r.stdout
             except Exception:
                 return ""
@@ -1054,9 +1003,12 @@ def fetch_company_profile(ticker: str, market: str) -> dict:
         queries = [
             f"{query_ticker} 公司简介",
             f"{query_ticker} 所属行业板块",
-            f"{query_ticker} 总市值 市盈率 TTM 市净率",
-            f"{query_ticker} 主营构成 收入构成 国内 海外",
         ]
+        # Only query market_cap/PE if not already provided by price_data
+        need_valuation = not (price_data and price_data.get('market_cap') and price_data.get('pe'))
+        if need_valuation:
+            queries.append(f"{query_ticker} 总市值 市盈率 TTM 市净率")
+        queries.append(f"{query_ticker} 主营构成 收入构成 国内 海外")
         with ThreadPoolExecutor(max_workers=4) as executor:
             stdout_results = list(executor.map(_run_query, queries))
 
@@ -1086,39 +1038,44 @@ def fetch_company_profile(ticker: str, market: str) -> dict:
             else:
                 profile["industry_position"] = "行业地位待更新"
 
-        # Query 3: market cap, PE, PB
-        stdout3 = stdout_results[2]
-        if stdout3:
-            headers = []
-            for line in stdout3.splitlines():
-                if re.match(r"\|\s*date\s*\|", line, re.I):
-                    headers = [p.strip() for p in line.strip().strip("|").split("|")]
-                elif re.match(r"\|\s*20\d{2}-\d{2}-\d{2}", line):
-                    parts = [p.strip() for p in line.strip().strip("|").split("|")]
-                    if len(parts) >= 2 and headers:
-                        for i, col in enumerate(headers):
-                            if i < len(parts):
-                                val = parts[i]
-                                if val and val != "-":
-                                    if "总市值" in col:
-                                        match = re.search(r"([\d.]+[亿万]?)", val)
-                                        if match: profile["market_cap"] = match.group(1) + "元"
-                                    elif "市盈率" in col or "PE" in col.upper():
-                                        match = re.search(r"([\d.]+)", val)
-                                        if match: profile["pe_ttm"] = match.group(1)
-                                    elif "市净率" in col or "PB" in col.upper():
-                                        match = re.search(r"([\d.]+)", val)
-                                        if match: profile["pb"] = match.group(1)
+        # Query 3 (conditional): market cap, PE, PB — only if not provided by price_data
+        val_idx = 2 if need_valuation else -1
+        rev_idx = 2 + (1 if need_valuation else 0)
+
+        if need_valuation and len(stdout_results) > val_idx:
+            stdout_val = stdout_results[val_idx]
+            if stdout_val:
+                headers = []
+                for line in stdout_val.splitlines():
+                    if re.match(r"\|\s*date\s*\|", line, re.I):
+                        headers = [p.strip() for p in line.strip().strip("|").split("|")]
+                    elif re.match(r"\|\s*20\d{2}-\d{2}-\d{2}", line):
+                        parts = [p.strip() for p in line.strip().strip("|").split("|")]
+                        if len(parts) >= 2 and headers:
+                            for i, col in enumerate(headers):
+                                if i < len(parts):
+                                    val = parts[i]
+                                    if val and val != "-":
+                                        if "总市值" in col:
+                                            match = re.search(r"([\d.]+[亿万]?)", val)
+                                            if match: profile["market_cap"] = match.group(1) + "元"
+                                        elif "市盈率" in col or "PE" in col.upper():
+                                            match = re.search(r"([\d.]+)", val)
+                                            if match: profile["pe_ttm"] = match.group(1)
+                                        elif "市净率" in col or "PB" in col.upper():
+                                            match = re.search(r"([\d.]+)", val)
+                                            if match: profile["pb"] = match.group(1)
                         if profile["market_cap"] or profile["pe_ttm"] or profile["pb"]:
                             break
 
-        # Query 4: revenue composition
-        stdout4 = stdout_results[3]
-        if stdout4:
-            domestic_match = re.search(r"(?:国内|中国|境内).*?([\d.]+)%", stdout4)
-            overseas_match = re.search(r"(?:海外|国外|境外|国际).*?([\d.]+)%", stdout4)
-            if domestic_match or overseas_match:
-                profile["revenue_split"] = f"国内 {domestic_match.group(1) if domestic_match else 'N/A'}% | 海外 {overseas_match.group(1) if overseas_match else 'N/A'}%"
+        # Revenue composition query
+        if len(stdout_results) > rev_idx:
+            stdout_rev = stdout_results[rev_idx]
+            if stdout_rev:
+                domestic_match = re.search(r"(?:国内|中国|境内).*?([\d.]+)%", stdout_rev)
+                overseas_match = re.search(r"(?:海外|国外|境外|国际).*?([\d.]+)%", stdout_rev)
+                if domestic_match or overseas_match:
+                    profile["revenue_split"] = f"国内 {domestic_match.group(1) if domestic_match else 'N/A'}% | 海外 {overseas_match.group(1) if overseas_match else 'N/A'}%"
 
         if not profile["business"]:
             profile["business"] = "主营业务数据待完善"
@@ -1156,8 +1113,7 @@ def fetch_earnings_forecast(ticker: str, market: str) -> dict:
             except Exception:
                 pass
 
-        r = subprocess.run(["python3.12", MX_DATA_SCRIPT, query_str],
-                           capture_output=True, text=True, timeout=TIMEOUT_DATA, env=env)
+        r = mx_data_cached(query_ticker, query_str, TTL_EARNINGS, env=env, timeout=TIMEOUT_DATA)
         headers = []
         for line in r.stdout.splitlines():
             if re.match(r"\|\s*date\s*\|", line, re.I):
@@ -1367,36 +1323,44 @@ def fetch_peer_comparison(ticker: str, market: str, pe_ttm: str) -> list:
 
 
 def fetch_catalysts(ticker: str, market: str) -> list:
-    """Fetch short-term catalysts."""
+    """Fetch short-term catalysts. Optimized: 2 mx-search calls instead of 7."""
     catalysts = []
     try:
-        keywords = ["订单", "减持", "大单", "中标", "签约", "回购", "增持"]
+        # Two grouped searches instead of 7 individual ones
+        search_groups = [
+            ("利好", f"{ticker} 订单 大单 中标 签约"),
+            ("资金面", f"{ticker} 减持 回购 增持"),
+        ]
 
-        def _search_keyword(keyword: str) -> tuple:
-            """Search one keyword, return (keyword, stdout)."""
+        def _search_group(group: tuple) -> tuple:
+            """Search one group, return (label, stdout)."""
+            label, query = group
             try:
-                r = subprocess.run(["python3.12", MX_SEARCH_SCRIPT, f"{ticker} {keyword}"],
+                r = subprocess.run(["python3.12", MX_SEARCH_SCRIPT, query],
                                    capture_output=True, text=True, timeout=TIMEOUT_NEWS)
-                return (keyword, r.stdout)
+                return (label, r.stdout)
             except Exception:
-                return (keyword, "")
+                return (label, "")
 
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            results = list(executor.map(_search_keyword, keywords))
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(_search_group, search_groups))
 
-        for keyword, stdout in results:
+        for label, stdout in results:
             if not stdout:
                 continue
-            if "减持" in keyword and ("结束" in stdout or "完成" in stdout):
-                catalysts.append(f"股东{keyword}计划已结束，抛压解除")
-            elif "订单" in keyword or "大单" in keyword or "中标" in keyword:
-                match = re.search(r"(\d+\.?\d*)\s*(亿元|万元)", stdout)
-                if match:
-                    catalysts.append(f"获得{keyword}{match.group(1)}{match.group(2)}，利好长期订单可见性")
-                else:
-                    catalysts.append(f"{keyword}动态，关注后续进展")
-            elif "回购" in keyword or "增持" in keyword:
-                catalysts.append(f"公司{keyword}，彰显管理层信心")
+            # Parse catalysts from the combined search results
+            if "减持" in stdout and ("结束" in stdout or "完成" in stdout):
+                catalysts.append("股东减持计划已结束，抛压解除")
+            if "回购" in stdout or "增持" in stdout:
+                catalysts.append("公司回购/增持，彰显管理层信心")
+            for kw in ["订单", "大单", "中标", "签约"]:
+                if kw in stdout:
+                    match = re.search(r"(\d+\.?\d*)\s*(亿元|万元)", stdout)
+                    if match:
+                        catalysts.append(f"获得{kw}{match.group(1)}{match.group(2)}，利好长期订单可见性")
+                    else:
+                        catalysts.append(f"{kw}动态，关注后续进展")
+                    break  # Only add one order-related catalyst
             if len(catalysts) >= 5:
                 break
         if not catalysts:
@@ -1407,26 +1371,40 @@ def fetch_catalysts(ticker: str, market: str) -> list:
     return catalysts
 
 
-def fetch_gs_financial_metrics(ticker: str, market: str) -> dict:
-    """Fetch Goldman Sachs standard core financial metrics."""
+def fetch_gs_financial_metrics(ticker: str, market: str, price_data: dict = None) -> dict:
+    """Fetch Goldman Sachs standard core financial metrics.
+
+    Args:
+        price_data: Optional dict from _fetch_price_from_mx with pe key.
+                    If provided and PE is present, skips the Beta/市盈率 query.
+    """
     metrics = {"roe": "N/A", "fcf": "N/A", "fcf_note": "", "debt_ratio": "N/A",
                "net_debt_ebitda": "N/A", "beta": "N/A"}
+
+    # Pre-fill PE from price_data if available
+    pe_known = None
+    if price_data and price_data.get('pe'):
+        pe_known = price_data['pe']
+
     try:
         query_ticker = DataParser.to_query_ticker(ticker, market)
 
-        # ── Parallelize 2 mx-data queries ──
+        # ── Parallelize queries ──
         def _run_query(query: str) -> str:
             try:
-                r = subprocess.run(["python3.12", MX_DATA_SCRIPT, query],
-                                   capture_output=True, text=True, timeout=TIMEOUT_DATA)
+                r = mx_data_cached(query_ticker, query, TTL_GS_METRICS, timeout=TIMEOUT_DATA)
                 return r.stdout
             except Exception:
                 return ""
 
         queries = [
             f"{query_ticker} 净资产收益率 ROE 自由现金流 资产负债率",
-            f"{query_ticker} Beta 系数 市盈率",
         ]
+        # Only query Beta/PE if PE not already known from price_data
+        if not pe_known:
+            queries.append(f"{query_ticker} Beta 系数 市盈率")
+        else:
+            queries.append(f"{query_ticker} Beta 系数")
         with ThreadPoolExecutor(max_workers=2) as executor:
             stdout_results = list(executor.map(_run_query, queries))
 
@@ -1621,9 +1599,24 @@ def save_to_notion(ticker: str, report_text: str):
         print(f"   ⚠️ Notion 存档失败: {e}")
 
 
-def fetch_revenue_composition(ticker: str, market: str) -> dict:
-    """Fetch revenue composition (domestic/overseas, business segments)."""
+def fetch_revenue_composition(ticker: str, market: str, revenue_split: str = "") -> dict:
+    """Fetch revenue composition (domestic/overseas, business segments).
+
+    Args:
+        revenue_split: Optional string from company_profile (e.g. '国内 60% | 海外 40%').
+                       If provided, parses it directly without mx-data query.
+    """
     composition = {"domestic": "N/A", "overseas": "N/A", "by_product": [], "by_region": []}
+
+    # Try to parse from company_profile's revenue_split first (saves 1 mx-data query)
+    if revenue_split:
+        dm = re.search(r"(?:国内|中国|境内)\s*([\d.]+)%", revenue_split)
+        om = re.search(r"(?:海外|国外|境外|国际)\s*([\d.]+)%", revenue_split)
+        if dm: composition["domestic"] = dm.group(1) + "%"
+        if om: composition["overseas"] = om.group(1) + "%"
+        if dm or om:
+            return composition  # Data found from profile, skip mx-data query
+
     try:
         query_ticker = DataParser.to_query_ticker(ticker, market)
         r = subprocess.run(["python3.12", MX_DATA_SCRIPT, f"{query_ticker} 营收构成 主营业务 国内 海外"],
