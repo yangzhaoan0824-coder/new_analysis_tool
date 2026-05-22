@@ -272,7 +272,7 @@ class EngineProcessor:
         composite_result = self.compute_composite_metrics(
             r, macro_score, weekly_text, analyst_target, current_price,
             company_profile, earnings_forecast, mx_financial_data,
-            news_text, ta_decision
+            news_text, ta_decision, consensus_rating
         )
 
         # ═══ Assemble all results ═══
@@ -307,7 +307,7 @@ class EngineProcessor:
                                    analyst_target, current_price,
                                    company_profile, earnings_forecast,
                                    mx_financial_data, news_text,
-                                   ta_decision) -> dict:
+                                   ta_decision, consensus_rating="") -> dict:
         """Compute all composite metrics using Decimal precision.
 
         This is the core cross-engine logic that fuses engine1 + engine2 data.
