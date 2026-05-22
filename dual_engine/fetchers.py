@@ -117,7 +117,7 @@ def fetch_analyst_target(ticker: str, market: str) -> str:
             mn = next((v for k, v in col_map.items() if "MIN" in k.upper()), None)
 
             if avg:
-                parts_out = [f"均值 {avg}"]
+                parts_out = [f"目标价均值 {avg}"]
                 if mx and mx != avg:
                     parts_out.append(f"最高 {mx}")
                 if mn and mn != avg:

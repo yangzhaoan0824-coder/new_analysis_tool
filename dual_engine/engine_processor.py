@@ -180,6 +180,14 @@ class EngineProcessor:
         # ═══ Analyst target ═══
         analyst_target = fetch_analyst_target(self.ticker, self.market)
         consensus_rating = ""
+        tp_from_analyst_target = None
+
+        # Extract target price number from analyst_target string (e.g. "目标价均值 35.52港元")
+        if analyst_target and "目标价" in analyst_target:
+            tp_match = re.search(r"目标价[^\d]*(\d+\.?\d*)", analyst_target)
+            if tp_match:
+                tp_from_analyst_target = float(tp_match.group(1))
+
         if mx_financial_data:
             tp = mx_financial_data.get("target_price")
             if tp:
@@ -187,6 +195,18 @@ class EngineProcessor:
                 upside = mx_financial_data.get("upside")
                 analyst_target = f"目标价 {tp} 评级{rating} 上涨空间{upside}%" if rating else f"目标价 {tp}"
                 consensus_rating = f"评级 {rating}" if rating else ""
+
+        # If analyst_target has target price but no upside yet, compute it
+        if analyst_target and "目标价" in analyst_target and "上涨空间" not in analyst_target:
+            tp_val = tp_from_analyst_target
+            cur_price = None
+            if self.market == "hk" and hk_price_data and hk_price_data.get('price'):
+                cur_price = hk_price_data['price']
+            elif self.market == "a" and a_price_data and a_price_data.get('price'):
+                cur_price = a_price_data['price']
+            if tp_val and cur_price:
+                upside_pct = ((tp_val - cur_price) / cur_price) * 100
+                analyst_target += f" 上涨空间{upside_pct:+.1f}%"
 
         # ═══ Analyst rating + target price (mx-data, mx-search fallback) ═══
         if not consensus_rating or not analyst_target or "目标价" not in analyst_target:
@@ -315,7 +335,9 @@ class EngineProcessor:
         # ── Analyst target price ──
         target_price_num = None
         try:
-            match = re.search(r"(?:均值|目标价)[:\s]*([\d.]+)", analyst_target)
+            match = re.search(r"(?:均值|目标价)[:\s]*(\d+[\.\d]*)", analyst_target)
+            if not match:
+                match = re.search(r"目标价[^\d]*(\d+\.?\d*)", analyst_target)
             if match:
                 target_price_num = float(match.group(1))
         except Exception:
