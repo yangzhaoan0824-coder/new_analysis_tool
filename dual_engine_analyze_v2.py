@@ -71,6 +71,15 @@ def analyze(ticker: str):
         except Exception as e:
             print(f"   ⚠️ JSON 报告保存失败：{e}")
 
+        # Save Markdown report for review
+        md_path = f"/tmp/dual_engine_{ticker}_{results.get('current_price', 'na')}.md"
+        try:
+            with open(md_path, 'w', encoding='utf-8') as f:
+                f.write(markdown_report)
+            print(f"📝 Markdown 报告已保存：{md_path}")
+        except Exception as e:
+            print(f"   ⚠️ Markdown 报告保存失败：{e}")
+
         # ── Step 5: Auto-archive ──
         print(f"   Step 4/5: 自动存档...")
         r = results["analysis_result"]
