@@ -954,7 +954,7 @@ def _fetch_price_from_mx(query_ticker: str, market: str) -> Optional[dict]:
     """
     err_tag = f"mx-data-{market}-price"
     try:
-        query_str = f"{query_ticker} 收盘价 涨跌幅 总市值 市盈率"
+        query_str = f"{query_ticker} 最新价 涨跌幅 总市值 市盈率"
         result = subprocess.run(
             ["python3.12", MX_DATA_SCRIPT, query_str],
             capture_output=True, text=True, timeout=TIMEOUT_DATA,
