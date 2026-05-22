@@ -458,6 +458,8 @@ class EngineProcessor:
             "catalysts_list": catalysts_list,
             "investment_thesis": investment_thesis,
             "confidence": confidence, "confidence_detail": confidence_detail,
+            "analyst_target": analyst_target,
+            "consensus_rating": consensus_rating,
             "fundamental_scores": fundamental_scores,
             "precision_factor": precision_str,
             "composite_score": str(composite_score),
