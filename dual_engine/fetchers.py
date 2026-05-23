@@ -1479,7 +1479,8 @@ def fetch_gs_financial_metrics(ticker: str, market: str, price_data: dict = None
     """
     metrics = {"roe": "N/A", "fcf": "N/A", "fcf_note": "", "debt_ratio": "N/A",
                "net_debt_ebitda": "N/A", "beta": "N/A",
-               "forecast_pe_fy1": "N/A", "forecast_peg_fy1": "N/A", "forecast_roe_fy1": "N/A"}
+               "forecast_pe_fy1": "N/A", "forecast_pe_fy2": "N/A", "forecast_pe_fy3": "N/A",
+               "forecast_peg_fy1": "N/A", "forecast_roe_fy1": "N/A"}
 
     # Pre-fill PE from price_data if available
     pe_known = None
@@ -1541,7 +1542,7 @@ def fetch_gs_financial_metrics(ticker: str, market: str, price_data: dict = None
                 if len(parts) >= 2 and headers2:
                     for i, col in enumerate(headers2[1:], 1):
                         if i < len(parts) and parts[i] and parts[i] != "-":
-                            if "Beta" in col or "β" in col:
+                            if "beta" in col.lower() or "β" in col or "Beta" in col:
                                 match = re.search(r"([\d.]+)", parts[i])
                                 if match: metrics["beta"] = match.group(1)
                     break
@@ -1550,24 +1551,37 @@ def fetch_gs_financial_metrics(ticker: str, market: str, price_data: dict = None
             metrics["beta"] = {"a": "1.15", "hk": "1.05"}.get(market, "1.10")
 
         # Parse query 3: Forward PE / PEG
+        # mx-data returns years in descending order (2028, 2027, 2026)
+        # We need to match by year: parts[0] contains the year (2026 = FY1)
         if len(stdout_results) > 2:
             stdout3 = stdout_results[2]
             headers3 = []
             for line in stdout3.splitlines():
                 if re.match(r"\|\s*date\s*\|", line, re.I):
                     headers3 = [p.strip() for p in line.strip().strip("|").split("|")]
-                elif re.match(r"\|\s*20\d", line):
+                elif re.match(r"\|\s*\d{4}\s*\|", line):
                     parts = [p.strip() for p in line.strip().strip("|").split("|")]
                     if len(parts) >= 2 and headers3:
+                        year = parts[0].strip()
                         for i, col in enumerate(headers3[1:], 1):
                             if i < len(parts) and parts[i] and parts[i] != "-":
-                                if "预测市盈率" in col or "PE" in col.upper():
-                                    if metrics["forecast_pe_fy1"] == "N/A":
-                                        metrics["forecast_pe_fy1"] = parts[i]
-                                elif "PEG" in col.upper() or "历史PEG" in col:
+                                val = parts[i]
+                                # Match year to FY1/FY2/FY3
+                                if year == "2026" and metrics["forecast_pe_fy1"] == "N/A":
+                                    if "预测市盈率" in col or "PE" in col.upper():
+                                        metrics["forecast_pe_fy1"] = val
+                                elif year == "2027":
+                                    if "预测市盈率" in col or "PE" in col.upper():
+                                        metrics["forecast_pe_fy2"] = val
+                                elif year == "2028":
+                                    if "预测市盈率" in col or "PE" in col.upper():
+                                        metrics["forecast_pe_fy3"] = val
+                                if "PEG" in col.upper() or "历史PEG" in col:
                                     if metrics["forecast_peg_fy1"] == "N/A":
-                                        metrics["forecast_peg_fy1"] = parts[i]
-                        break
+                                        metrics["forecast_peg_fy1"] = val
+                        # Only break after processing the 2026 row for FY1, continue for other years
+                        if metrics["forecast_pe_fy1"] != "N/A":
+                            break
 
         if metrics["debt_ratio"] != "N/A":
             match = re.search(r"([\d.]+)", metrics["debt_ratio"])
