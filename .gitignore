@@ -6,3 +6,8 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Agent Memory — 内部状态文件不入库
+.agent-memory/.last_consolidation
+.agent-memory/.archived_summaries.json
+.agent-memory/session_summaries/
