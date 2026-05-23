@@ -120,6 +120,7 @@ class ReportGenerator:
         rsi_val = ti.get('rsi', None) or ti.get('col_5', None)
         macd_diff = ti.get('macd_diff', None) or ti.get('col_3', None)
         macd_dea = ti.get('macd_dea', None) or ti.get('col_4', None)
+        macd_histogram = ti.get('macd_histogram', None)
         macd_golden = (macd_diff > macd_dea) if (macd_diff is not None and macd_dea is not None) else None
 
         currency = "港元" if market == "hk" else "元"
@@ -137,6 +138,15 @@ class ReportGenerator:
         elif rsi_val and rsi_val > 60: rsi_interp = "🟡 接近超买"
         elif rsi_val: rsi_interp = "🟢 正常"
         else: rsi_interp = "N/A"
+
+        # MACD display: show DIFF, DEA, histogram values when available
+        if macd_diff is not None and macd_dea is not None:
+            diff_str = f"{macd_diff:.3f}"
+            dea_str = f"{macd_dea:.3f}"
+            hist_str = f"{macd_histogram:.4f}" if macd_histogram is not None else "N/A"
+            macd_signal = f"DIFF={diff_str} DEA={dea_str} 柱={hist_str}"
+        else:
+            macd_signal = "N/A"
 
         d = r.dashboard if isinstance(r.dashboard, dict) else {}
         cc = d.get("core_conclusion", {})
@@ -290,10 +300,26 @@ class ReportGenerator:
         # ROE/growth display
         roe_display = gs_metrics.get('roe', 'N/A')
         mcap_display = market_cap_display if market_cap_display != '数据源限制' else 'N/A'
+        # Determine market cap size label dynamically
+        _mcap_raw = market_cap_display
+        try:
+            _mcap_num = float(re.sub(r'[^\d.]', '', str(_mcap_raw)))
+            if _mcap_num >= 200:
+                mcap_size_label = "大盘"
+            elif _mcap_num >= 50:
+                mcap_size_label = "中小盘"
+            else:
+                mcap_size_label = "小盘"
+        except:
+            mcap_size_label = market_label
         growth_display = 'N/A'
         if earnings_forecast:
             pg = earnings_forecast.get('profit_growth', [])
-            if pg and pg[0] != 'N/A': growth_display = str(pg[0])
+            if pg:
+                for g in pg:
+                    if g and g != 'N/A':
+                        growth_display = str(g)
+                        break
 
         # Trade action
         if rating in ("买入", "增持"):
@@ -684,7 +710,7 @@ class ReportGenerator:
 | MA5 | {ma5_str} | {ma5_interp} |
 | MA20 | {ma20_str} | {ma20_interp} |
 | RSI | {rsi_str} | {rsi_interp} |
-| MACD | {('🟢 金叉' if macd_golden else '🔴 死叉') if macd_golden is not None else 'N/A'} | {'🟢 短期多头' if macd_golden else '🔴 短期空头' if macd_golden is not None else 'N/A'} |
+| MACD | {macd_signal} | {('🟢 金叉' if macd_golden else '🔴 死叉') if macd_golden is not None else 'N/A'} |
 
 ⚠️ 风险评估
 
@@ -695,7 +721,7 @@ class ReportGenerator:
 ├────────────┼────────┼───────┼──────────────────────────────┤
 │ ROE偏低    │ 🟡 中  │ 🟡 中 │ {roe_val}低于行业，盈利质量待提升 │
 ├────────────┼────────┼───────┼──────────────────────────────┤
-│ {market_label}流动性 │ 🟡 中  │ 🟡 中 │ {'港股通成交偏淡，做空机制风险' if market == 'hk' else '中小盘股，成交偏淡'}           │
+│ {mcap_size_label}流动性 │ 🟡 中  │ 🟡 中 │ {'港股通成交偏淡，做空机制风险' if market == 'hk' else '中小盘股，成交偏淡'}           │
 ├────────────┼────────┼───────┼──────────────────────────────┤
 │ {'港股通资金' if market == 'hk' else '汇率波动'}   │ 🟡 中  │ 🟡 中 │ {'南向资金波动影响股价' if market == 'hk' else '美元收入占比高'}               │
 └────────────┴────────┴───────┴──────────────────────────────┘

@@ -364,6 +364,8 @@ def _parse_a_tech_json(query_str: str, tech_data: dict) -> None:
                     tech_data["macd_diff"] = val
                 elif "dea" in dn_lower:
                     tech_data["macd_dea"] = val
+                elif "柱状" in display_name or "macd柱" in dn_lower or "histogram" in dn_lower:
+                    tech_data["macd_histogram"] = val
 
             # Update date from headName
             if head_names and latest_idx < len(head_names):
@@ -1177,6 +1179,13 @@ def fetch_earnings_forecast(ticker: str, market: str) -> dict:
         if not forecast["years"]:
             _try_parse_earnings_json(query_str, forecast)
 
+        # ── Supplement: if revenue/profit/EPS still N/A, query historical financials ──
+        has_nas = any(v == "N/A" for v in forecast.get("revenue", [])[:1]) \
+                  or any(v == "N/A" for v in forecast.get("net_profit", [])[:1]) \
+                  or any(v == "N/A" for v in forecast.get("eps", [])[:1])
+        if has_nas:
+            _supplement_historical_financials(query_ticker, forecast, env)
+
         if not forecast["years"]:
             forecast = DataParser.structure_earnings_forecast(forecast)
         elif len(forecast["years"]) < 3:
@@ -1202,6 +1211,96 @@ def _strip_unit(val: str) -> str:
         except ValueError:
             return val
     return val
+
+
+def _supplement_historical_financials(query_ticker: str, forecast: dict, env: dict) -> None:
+    """Supplement earnings forecast with historical financial data from mx-data.
+
+    When the consensus query returns N/A for revenue/profit/EPS, this function
+    queries mx-data for actual historical financials (营业总收入, 归母净利润, EPS,
+    毛利率, 利润同比增长率, PE, PEG) and fills them into the forecast dict.
+    Also updates forecast_pe_fy1 and forecast_peg_fy1 if still N/A.
+    """
+    try:
+        supp_query = f"{query_ticker} 营业总收入 归母净利润 EPS 毛利率 利润同比增长率 PE PEG ROE"
+        r = mx_data_cached(query_ticker, supp_query, TTL_EARNINGS, env=env, timeout=TIMEOUT_DATA)
+
+        headers = []
+        rows_parsed = 0
+        for line in r.stdout.splitlines():
+            if re.match(r"\|\s*date\s*\|", line, re.I):
+                headers = [p.strip() for p in line.strip().strip("|").split("|")]
+            elif re.match(r"\|\s*(20\d{2}|\d{4}[一三四中]", line):
+                parts = [p.strip() for p in line.strip().strip("|").split("|")]
+                if len(parts) < 2 or not headers:
+                    continue
+
+                row_dict = {}
+                for i, col in enumerate(headers):
+                    if i < len(parts):
+                        row_dict[col] = parts[i]
+
+                year = parts[0]
+                # Skip if already filled from consensus
+                if year in forecast["years"]:
+                    idx = forecast["years"].index(year)
+                    # Only fill N/A slots
+                    if idx < len(forecast["revenue"]) and forecast["revenue"][idx] == "N/A":
+                        rev = _strip_unit(row_dict.get("营业总收入") or row_dict.get("营业收入"))
+                        if rev and rev != "-": forecast["revenue"][idx] = rev
+                    if idx < len(forecast["net_profit"]) and forecast["net_profit"][idx] == "N/A":
+                        np_val = _strip_unit(row_dict.get("归母净利润") or row_dict.get("净利润"))
+                        if np_val and np_val != "-": forecast["net_profit"][idx] = np_val
+                    if idx < len(forecast["eps"]) and forecast["eps"][idx] == "N/A":
+                        eps_val = row_dict.get("EPS(稀释)") or row_dict.get("每股收益")
+                        if eps_val and eps_val != "-": forecast["eps"][idx] = eps_val
+                    if idx < len(forecast["profit_growth"]) and forecast["profit_growth"][idx] == "N/A":
+                        pg_raw = row_dict.get("归母净利润增长率") or row_dict.get("利润同比增长率")
+                        if pg_raw and pg_raw != "-":
+                            m = re.search(r"([\-\d.]+)", pg_raw)
+                            if m: forecast["profit_growth"][idx] = m.group(1) + "%"
+                    continue
+
+                # New year entry — add to forecast
+                rev = _strip_unit(row_dict.get("营业总收入") or row_dict.get("营业收入"))
+                np_val = _strip_unit(row_dict.get("归母净利润") or row_dict.get("净利润"))
+                eps_val = row_dict.get("EPS(稀释)") or row_dict.get("每股收益")
+                pg_raw = row_dict.get("归母净利润增长率") or row_dict.get("利润同比增长率")
+                rg_raw = row_dict.get("营业总收入增长率") or row_dict.get("营收同比增长率")
+
+                profit_growth_val = None
+                if pg_raw and pg_raw != "-":
+                    m = re.search(r"([\-\d.]+)", pg_raw)
+                    if m: profit_growth_val = m.group(1) + "%"
+
+                revenue_growth_val = None
+                if rg_raw and rg_raw != "-":
+                    m = re.search(r"([\-\d.]+)", rg_raw)
+                    if m: revenue_growth_val = m.group(1) + "%"
+
+                forecast["years"].append(year)
+                forecast["revenue"].append(rev if rev and rev != "-" else "N/A")
+                forecast["revenue_growth"].append(revenue_growth_val or "N/A")
+                forecast["net_profit"].append(np_val if np_val and np_val != "-" else "N/A")
+                forecast["profit_growth"].append(profit_growth_val or "N/A")
+                forecast["eps"].append(eps_val if eps_val and eps_val != "-" else "N/A")
+
+                # Fill forward metrics if still N/A
+                pe_val = row_dict.get("PE") or row_dict.get("市盈率")
+                peg_val = row_dict.get("PEG") or row_dict.get("历史PEG值")
+                roe_val = row_dict.get("ROE") or row_dict.get("ROE(%)")
+                if pe_val and pe_val != "-" and forecast["forecast_pe_fy1"] == "N/A":
+                    forecast["forecast_pe_fy1"] = pe_val
+                if peg_val and peg_val != "-" and forecast["forecast_peg_fy1"] == "N/A":
+                    forecast["forecast_peg_fy1"] = peg_val
+                if roe_val and roe_val != "-" and forecast["forecast_roe_fy1"] == "N/A":
+                    forecast["forecast_roe_fy1"] = roe_val + "%" if "%" not in roe_val else roe_val
+
+                rows_parsed += 1
+                if rows_parsed >= 3 or len(forecast["years"]) >= 3:
+                    break
+    except Exception as e:
+        log_error("supplement_historical", str(e))
 
 
 def _try_parse_earnings_json(query_str: str, forecast: dict, max_age: int = 86400) -> None:
@@ -1379,7 +1478,8 @@ def fetch_gs_financial_metrics(ticker: str, market: str, price_data: dict = None
                     If provided and PE is present, skips the Beta/市盈率 query.
     """
     metrics = {"roe": "N/A", "fcf": "N/A", "fcf_note": "", "debt_ratio": "N/A",
-               "net_debt_ebitda": "N/A", "beta": "N/A"}
+               "net_debt_ebitda": "N/A", "beta": "N/A",
+               "forecast_pe_fy1": "N/A", "forecast_peg_fy1": "N/A", "forecast_roe_fy1": "N/A"}
 
     # Pre-fill PE from price_data if available
     pe_known = None
@@ -1405,7 +1505,9 @@ def fetch_gs_financial_metrics(ticker: str, market: str, price_data: dict = None
             queries.append(f"{query_ticker} Beta 系数 市盈率")
         else:
             queries.append(f"{query_ticker} Beta 系数")
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        # Query forward PE / PEG for forecast metrics
+        queries.append(f"{query_ticker} 预测市盈率PE 历史PEG值")
+        with ThreadPoolExecutor(max_workers=3) as executor:
             stdout_results = list(executor.map(_run_query, queries))
 
         # Parse query 1: ROE, FCF, debt ratio
@@ -1446,6 +1548,26 @@ def fetch_gs_financial_metrics(ticker: str, market: str, price_data: dict = None
 
         if metrics["beta"] == "N/A":
             metrics["beta"] = {"a": "1.15", "hk": "1.05"}.get(market, "1.10")
+
+        # Parse query 3: Forward PE / PEG
+        if len(stdout_results) > 2:
+            stdout3 = stdout_results[2]
+            headers3 = []
+            for line in stdout3.splitlines():
+                if re.match(r"\|\s*date\s*\|", line, re.I):
+                    headers3 = [p.strip() for p in line.strip().strip("|").split("|")]
+                elif re.match(r"\|\s*20\d", line):
+                    parts = [p.strip() for p in line.strip().strip("|").split("|")]
+                    if len(parts) >= 2 and headers3:
+                        for i, col in enumerate(headers3[1:], 1):
+                            if i < len(parts) and parts[i] and parts[i] != "-":
+                                if "预测市盈率" in col or "PE" in col.upper():
+                                    if metrics["forecast_pe_fy1"] == "N/A":
+                                        metrics["forecast_pe_fy1"] = parts[i]
+                                elif "PEG" in col.upper() or "历史PEG" in col:
+                                    if metrics["forecast_peg_fy1"] == "N/A":
+                                        metrics["forecast_peg_fy1"] = parts[i]
+                        break
 
         if metrics["debt_ratio"] != "N/A":
             match = re.search(r"([\d.]+)", metrics["debt_ratio"])

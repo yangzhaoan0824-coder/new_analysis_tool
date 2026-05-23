@@ -272,13 +272,19 @@ def calc_fundamental_scores(earnings_forecast, gs_metrics, mx_fin,
     if earnings_forecast:
         pg = earnings_forecast.get("profit_growth", [])
         if isinstance(pg, list) and pg:
-            profit_growth = parse_num(pg[0])
+            for v in pg:
+                if v and v != "N/A":
+                    profit_growth = parse_num(v)
+                    break
 
     revenue = Decimal("0")
     if earnings_forecast:
         rev = earnings_forecast.get("revenue", [])
         if isinstance(rev, list) and rev:
-            revenue = parse_num(rev[0])
+            for v in rev:
+                if v and v != "N/A":
+                    revenue = parse_num(v)
+                    break
     if revenue == 0 and mx_fin:
         revenue = parse_num(mx_fin.get("revenue"))
 
@@ -340,8 +346,12 @@ def calc_fundamental_scores(earnings_forecast, gs_metrics, mx_fin,
     scores["商业模式"] = min(biz, 25)
 
     biz_detail_parts = ["基础分10"]
-    if revenue: biz_detail_parts.append(f"营收{float(revenue):.0f}亿(+{min(biz-10,5)})")
-    if profit_growth: biz_detail_parts.append(f"增速{float(profit_growth):+.0f}%(+{min(5 if profit_growth >= 20 else 3 if profit_growth >= 10 else 1, 5)})")
+    if revenue: biz_detail_parts.append(f"营收{float(revenue):.0f}亿")
+    _rev_bonus = 5 if revenue >= 1000 else 4 if revenue >= 300 else 3 if revenue >= 100 else 2 if revenue > 0 else 0
+    if _rev_bonus: biz_detail_parts.append(f"+{_rev_bonus}分")
+    if profit_growth: biz_detail_parts.append(f"增速{float(profit_growth):+.0f}%")
+    _gr_bonus = 5 if profit_growth >= 20 else 3 if profit_growth >= 10 else 1 if profit_growth > 0 else 0
+    if _gr_bonus: biz_detail_parts.append(f"+{_gr_bonus}分")
     if company_profile:
         pos = str(company_profile.get("industry_position", "")).lower()
         if "第一" in pos or "龙头" in pos or ">40" in pos:

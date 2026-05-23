@@ -391,9 +391,10 @@ class EngineProcessor:
         # Enrich current stock's peer entry with profit growth from earnings
         if earnings_forecast and earnings_forecast.get("profit_growth"):
             latest_growth = None
-            for pg in reversed(earnings_forecast["profit_growth"]):
-                if pg and pg != "N/A":
-                    latest_growth = pg
+            pg_list = earnings_forecast.get("profit_growth", [])
+            for pg in reversed(pg_list):
+                if pg and str(pg) != "N/A":
+                    latest_growth = str(pg)
                     break
             if latest_growth:
                 for peer in peers:
