@@ -1552,7 +1552,11 @@ def fetch_gs_financial_metrics(ticker: str, market: str, price_data: dict = None
 
         # Parse query 3: Forward PE / PEG
         # mx-data returns years in descending order (2028, 2027, 2026)
-        # We need to match by year: parts[0] contains the year (2026 = FY1)
+        # Parse query 3: Forward PE/PEG (e.g. "预测市盈率PE", "预测PEG")
+        # mx-data 返回按年份降序：2028 → 2027 → 2026
+        # 映射：2026=FY1, 2027=FY2, 2028=FY3
+        year_to_pe_field = {"2026": "forecast_pe_fy1", "2027": "forecast_pe_fy2", "2028": "forecast_pe_fy3"}
+        # PEG只取FY1（2026年），其他年份不映射
         if len(stdout_results) > 2:
             stdout3 = stdout_results[2]
             headers3 = []
@@ -1563,25 +1567,17 @@ def fetch_gs_financial_metrics(ticker: str, market: str, price_data: dict = None
                     parts = [p.strip() for p in line.strip().strip("|").split("|")]
                     if len(parts) >= 2 and headers3:
                         year = parts[0].strip()
+                        pe_field = year_to_pe_field.get(year)
                         for i, col in enumerate(headers3[1:], 1):
                             if i < len(parts) and parts[i] and parts[i] != "-":
                                 val = parts[i]
-                                # Match year to FY1/FY2/FY3
-                                if year == "2026" and metrics["forecast_pe_fy1"] == "N/A":
-                                    if "预测市盈率" in col or "PE" in col.upper():
-                                        metrics["forecast_pe_fy1"] = val
-                                elif year == "2027":
-                                    if "预测市盈率" in col or "PE" in col.upper():
-                                        metrics["forecast_pe_fy2"] = val
-                                elif year == "2028":
-                                    if "预测市盈率" in col or "PE" in col.upper():
-                                        metrics["forecast_pe_fy3"] = val
-                                if "PEG" in col.upper() or "历史PEG" in col:
-                                    if metrics["forecast_peg_fy1"] == "N/A":
-                                        metrics["forecast_peg_fy1"] = val
-                        # Only break after processing the 2026 row for FY1, continue for other years
-                        if metrics["forecast_pe_fy1"] != "N/A":
-                            break
+                                # PE: 精确匹配"预测市盈率"，排除含"PEG"的列（避免误匹配"预测PEG(日期)"）
+                                if pe_field and ("预测市盈率" in col or "预测PE" in col) and "PEG" not in col:
+                                    if metrics[pe_field] == "N/A":
+                                        metrics[pe_field] = val
+                                # PEG: 只取FY1（2026年）的值，避免年份顺序导致覆盖
+                                if "预测PEG" in col and year == "2026" and metrics["forecast_peg_fy1"] == "N/A":
+                                    metrics["forecast_peg_fy1"] = val
 
         if metrics["debt_ratio"] != "N/A":
             match = re.search(r"([\d.]+)", metrics["debt_ratio"])
