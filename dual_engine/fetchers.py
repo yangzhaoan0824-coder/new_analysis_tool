@@ -1539,20 +1539,21 @@ def fetch_peer_comparison(ticker: str, market: str, pe_ttm: str) -> list:
         valid_peers = [p for p in peers if get_pe_val(p) < 9999]
         min_peer = valid_peers[0] if valid_peers else None
         max_peer = valid_peers[-1] if valid_peers else None
-        
+
     except Exception as e:
         log_error("peer_comparison", str(e))
-    
-    # Only show benchmark rows (median, min, max)
+        min_peer, max_peer, valid_peers = None, None, []
+
+    # Show: median + min + max + up to 2 additional peers for context
     result = []
-    
+
     # Add industry median
     median_str = industry_median if industry_median != "N/A" else ("25-35" if market != "hk" else "15-25")
     result.append({
         "name": "行业中位数", "code": "-", "pe": median_str,
         "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "note": "汽车零部件（参考基准）"
     })
-    
+
     # Add min/max PE peers
     if min_peer:
         result.append({
@@ -1561,7 +1562,7 @@ def fetch_peer_comparison(ticker: str, market: str, pe_ttm: str) -> list:
             "roe": str(min_peer.get("roe", "N/A")), "mcap": str(min_peer.get("mcap", "N/A")),
             "growth": str(min_peer.get("growth", "N/A")), "note": "🟢 行业最低PE"
         })
-    
+
     if max_peer and max_peer != min_peer:
         result.append({
             "name": max_peer.get("name", "最高PE")[:8], "code": max_peer.get("code", "-"),
@@ -1569,7 +1570,24 @@ def fetch_peer_comparison(ticker: str, market: str, pe_ttm: str) -> list:
             "roe": str(max_peer.get("roe", "N/A")), "mcap": str(max_peer.get("mcap", "N/A")),
             "growth": str(max_peer.get("growth", "N/A")), "note": "🔴 行业最高PE"
         })
-    
+
+    # Add additional peers (skip min/max which are already added)
+    skip_codes = set()
+    if min_peer: skip_codes.add(min_peer.get("code", ""))
+    if max_peer: skip_codes.add(max_peer.get("code", ""))
+    extra_count = 0
+    for p in valid_peers:
+        code = p.get("code", "")
+        if code and code not in skip_codes and extra_count < 2:
+            result.append({
+                "name": p.get("name", "")[:8], "code": code,
+                "pe": str(p.get("pe", "N/A")), "peg": str(p.get("peg", "N/A")),
+                "roe": str(p.get("roe", "N/A")), "mcap": str(p.get("mcap", "N/A")),
+                "growth": str(p.get("growth", "N/A")), "note": p.get("note", "")[:32]
+            })
+            skip_codes.add(code)
+            extra_count += 1
+
     return result
 
 
