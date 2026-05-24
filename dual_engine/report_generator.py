@@ -473,7 +473,8 @@ class ReportGenerator:
         else:
             title_ticker = ticker
 
-        report = f"""📈 {r.name} ({title_ticker}) 投资研究报告
+        stock_name = r.name or ticker
+        report = f"""📈 {stock_name} ({title_ticker}) 投资研究报告
 
 > 报告日期：{datetime.now().strftime('%Y年%m月%d日')} | 分析师：AI Analyst | 市场：{market_label} | 时效：本周内
 
@@ -486,15 +487,29 @@ class ReportGenerator:
 └─────────┴──────────┴──────────┴──────────┴────────────┘
 
 > 核心投资逻辑：{investment_thesis if investment_thesis else '数据不足，无法生成投资论点'}
-
-**核心业务构成**：
+"""
+        # Business composition from company_profile
+        biz_desc = company_profile.get('business', '') if company_profile else ''
+        revenue_comp_table = ""
+        if revenue_comp.get('by_product'):
+            rows = []
+            for item in revenue_comp['by_product'][:5]:
+                name = item.get('name', '业务')
+                rev = item.get('revenue', 'N/A')
+                pct = item.get('percent', 'N/A')
+                rows.append(f"| {name[:20]:<22} │ {str(rev):>8} │ {str(pct):>6} |")
+            revenue_comp_table = "\n".join(rows)
+        elif biz_desc:
+            revenue_comp_table = f"| {biz_desc[:22]:<22} │    N/A   │    N/A   |"
+        else:
+            revenue_comp_table = "| 主营业务数据待完善            │    N/A   │    N/A   |"
+        
+        report += f"""**核心业务构成**：
 
 ┌──────────────────────────────┬──────────┬──────────┐
 │ 业务板块                     │ 营收(亿元) │    占比   │
 ├──────────────────────────────┼──────────┼──────────┤
-│ 制冷空调电器零部件           │    N/A   │    N/A   │
-│ 汽车零部件                   │    N/A   │    N/A   │
-│ 战略新兴业务（机器人/液冷）  │    N/A   │     -    │
+{revenue_comp_table}
 └──────────────────────────────┴──────────┴──────────┘
 
 > 注：业务构成数据来自公司财报，请以实际披露为准
@@ -694,8 +709,9 @@ class ReportGenerator:
             })
         
         # Add current stock row
+        stock_name = r.name or ticker
         peer_rows.append({
-            "name": r.name, "pe": actual_pe, "peg": peg_display,
+            "name": stock_name, "pe": actual_pe, "peg": peg_display,
             "roe": roe_display, "mcap": mcap_display, "growth": growth_display,
             "advantage": current_advantage
         })
@@ -711,13 +727,13 @@ class ReportGenerator:
             if _cur_pe is not None and _med_pe is not None and _med_pe > 0:
                 pe_ratio = _cur_pe / _med_pe
                 if pe_ratio < 0.5:
-                    peer_insight = f"> {r.name} PE {actual_pe}x 不到行业中位数的一半，"
+                    peer_insight = f"> {stock_name} PE {actual_pe}x 不到行业中位数的一半，"
                 elif pe_ratio < 1:
-                    peer_insight = f"> {r.name} PE {actual_pe}x 低于行业中位数，"
+                    peer_insight = f"> {stock_name} PE {actual_pe}x 低于行业中位数，"
                 elif pe_ratio > 1.5:
-                    peer_insight = f"> {r.name} PE {actual_pe}x 显著高于行业中位数，"
+                    peer_insight = f"> {stock_name} PE {actual_pe}x 显著高于行业中位数，"
                 else:
-                    peer_insight = f"> {r.name} PE {actual_pe}x 接近行业中位数，"
+                    peer_insight = f"> {stock_name} PE {actual_pe}x 接近行业中位数，"
                 if peg_display not in ("-", "N/A"):
                     peer_insight += f"PEG {peg_display} {'极低' if float(peg_display) < 0.5 else '偏低' if float(peg_display) < 1 else '合理'}。"
                 if growth_display not in ("N/A", "-"):
@@ -728,16 +744,30 @@ class ReportGenerator:
                         peer_insight += f"但 FY1 预测回升至 {fy1_roe_val}。"
         except: pass
 
-        report += f"""└──────────┴───────┴───────┴──────────┴──────────┴──────────┴──────────────────────────────────┘
-
+        # Dynamic industry position and tags from company_profile
+        _biz = company_profile.get('business', '') if company_profile else ''
+        _pos = company_profile.get('industry_position', '行业地位待更新') if company_profile else '行业地位待更新'
+        
+        # Extract key customers if available
+        _customers = company_profile.get('key_customers', '') if company_profile else ''
+        customers_block = f"- **核心客户**：{_customers}" if _customers else ""
+        
+        # Concept tags - use available info or generic fallback
+        if market == "hk":
+            concept_tags = "仓储机器人 | AMR解决方案 | 智慧物流 | AI机器人 | 港股"
+        elif market == "us":
+            concept_tags = "科技股 | AI | 机器人 | 自动化"
+        else:
+            concept_tags = "机器人 | 人工智能 | 智慧物流 | 自动化"
+        
+        report += f"""
 {peer_insight}
 
-**行业地位**：
-- **制冷领域**：电子膨胀阀、四通换向阀全球市占率均超 **N/A**，N类核心产品全球第一
-- **汽车热管理**：新能源车热管理集成组件全球市占率 **N/A**
-- **核心客户**：美的、格力、海尔（制冷）；特斯拉、比亚迪（汽车）
+**行业地位**：{_pos}
 
-**概念标签**：全球热管理龙头 | 家电出海 | 新能源汽车热管理 | AI算力液冷储能 | 人形机器人核心零部件
+{customers_block}
+
+**概念标签**：{concept_tags}
 
 > 注：行业地位数据来自公司公告和市场研究，请以实际披露为准
 

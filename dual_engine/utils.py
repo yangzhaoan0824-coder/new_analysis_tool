@@ -33,12 +33,15 @@ def clear_error_log():
 def detect_market(ticker: str) -> str:
     """Detect market from ticker format.
 
-    - HK prefix + digits → 'hk'
-    - Pure 6-digit number → 'a'
+    - HK prefix + digits (e.g. HK08379) → 'hk'
+    - .HK suffix (e.g. 08379.HK) → 'hk'
+    - Pure 6-digit number (e.g. 002050) → 'a'
     - Otherwise → 'us'
     """
     t = ticker.strip().upper()
     if t.startswith("HK") and t[2:].isdigit():
+        return MARKET_HK
+    if t.endswith(".HK"):
         return MARKET_HK
     if t.isdigit() and len(t) == 6:
         return MARKET_A
