@@ -616,8 +616,7 @@ class ReportGenerator:
 ├──────────┼───────┼───────┼──────────┼──────────┼──────────┼──────────────────────────────────┤
 """
 
-        # Peer comparison rows - use peers directly from fetch_peer_comparison
-        # Format: [行业中位数, 最低PE公司, 最高PE公司, separator, ...other_peers, 当前标的]
+        # Peer comparison rows - simplified: benchmark + current stock only
         peer_rows = []
         
         # Parse industry median for PE comparison
@@ -628,7 +627,7 @@ class ReportGenerator:
                 median_pe = str(p.get("pe", "N/A"))
                 break
         
-        # Add current stock with PE comparison icon
+        # Add PE comparison icon for current stock
         pe_compare_icon = ""
         try:
             _cur_pe = float(str(actual_pe).replace("倍", "")) if actual_pe not in ("-", "N/A") else None
@@ -653,33 +652,24 @@ class ReportGenerator:
         except: pass
         current_advantage = f"{pe_compare_icon}{industry_pos}" if pe_compare_icon else str(industry_pos)
         
-        # Add rows from peers data (includes benchmark, min/max, separator, other peers)
+        # Add benchmark rows (median, min, max)
         for p in peers:
-            name = str(p.get("name", ""))
-            if name == "__CURRENT__":
-                # Replace with current stock
-                peer_rows.append({
-                    "name": r.name, "pe": actual_pe, "peg": peg_display,
-                    "roe": roe_display, "mcap": mcap_display, "growth": growth_display,
-                    "advantage": current_advantage
-                })
-            elif name not in ("当前标的",):
-                peer_rows.append({
-                    "name": name[:8], "pe": str(p.get("pe", "N/A")),
-                    "peg": str(p.get("peg", "N/A")),
-                    "roe": str(p.get("roe", "N/A"))[:8],
-                    "mcap": str(p.get("mcap", "N/A"))[:8],
-                    "growth": str(p.get("growth", "N/A"))[:8],
-                    "advantage": str(p.get("note", ""))
-                })
-        
-        # Add current stock if not already added
-        if not any(str(p.get("name", "")) == r.name for p in peer_rows):
             peer_rows.append({
-                "name": r.name, "pe": actual_pe, "peg": peg_display,
-                "roe": roe_display, "mcap": mcap_display, "growth": growth_display,
-                "advantage": current_advantage
+                "name": str(p.get("name", ""))[:8], 
+                "pe": str(p.get("pe", "N/A")),
+                "peg": str(p.get("peg", "N/A")),
+                "roe": str(p.get("roe", "N/A"))[:8],
+                "mcap": str(p.get("mcap", "N/A"))[:8],
+                "growth": str(p.get("growth", "N/A"))[:8],
+                "advantage": str(p.get("note", ""))
             })
+        
+        # Add current stock row
+        peer_rows.append({
+            "name": r.name, "pe": actual_pe, "peg": peg_display,
+            "roe": roe_display, "mcap": mcap_display, "growth": growth_display,
+            "advantage": current_advantage
+        })
 
         for i, row in enumerate(peer_rows):
             report += f"│ {row['name'][:8]:>8} │ {row['pe']:>5} │ {row['peg']:>5} │ {row.get('roe','N/A'):>8} │ {row.get('mcap','N/A'):>8} │ {row.get('growth','N/A'):>8} │ {row['advantage'][:32]} │\n"

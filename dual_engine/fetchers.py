@@ -1543,7 +1543,7 @@ def fetch_peer_comparison(ticker: str, market: str, pe_ttm: str) -> list:
     except Exception as e:
         log_error("peer_comparison", str(e))
     
-    # Build result with benchmark + min/max peers
+    # Only show benchmark rows (median, min, max)
     result = []
     
     # Add industry median
@@ -1553,7 +1553,7 @@ def fetch_peer_comparison(ticker: str, market: str, pe_ttm: str) -> list:
         "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "note": "汽车零部件（参考基准）"
     })
     
-    # Add min PE peer with actual data
+    # Add min/max PE peers
     if min_peer:
         result.append({
             "name": min_peer.get("name", "最低PE")[:8], "code": min_peer.get("code", "-"),
@@ -1562,7 +1562,6 @@ def fetch_peer_comparison(ticker: str, market: str, pe_ttm: str) -> list:
             "growth": str(min_peer.get("growth", "N/A")), "note": "🟢 行业最低PE"
         })
     
-    # Add max PE peer with actual data (if different from min)
     if max_peer and max_peer != min_peer:
         result.append({
             "name": max_peer.get("name", "最高PE")[:8], "code": max_peer.get("code", "-"),
@@ -1570,17 +1569,6 @@ def fetch_peer_comparison(ticker: str, market: str, pe_ttm: str) -> list:
             "roe": str(max_peer.get("roe", "N/A")), "mcap": str(max_peer.get("mcap", "N/A")),
             "growth": str(max_peer.get("growth", "N/A")), "note": "🔴 行业最高PE"
         })
-    
-    # Add separator
-    result.append({
-        "name": "────────", "code": "───", "pe": "───", "peg": "───",
-        "roe": "───", "mcap": "───", "growth": "───", "note": "─────────────────────────"
-    })
-    
-    # Add remaining peers (excluding min/max already shown)
-    for p in peers:
-        if p != min_peer and p != max_peer:
-            result.append(p)
     
     return result
 
