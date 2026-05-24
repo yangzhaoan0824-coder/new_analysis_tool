@@ -1526,7 +1526,7 @@ def fetch_peer_comparison(ticker: str, market: str, pe_ttm: str) -> list:
                 ))
                 peers.extend(peer_data_list)
         
-        # 4. Sort peers by PE
+        # 4. Sort peers by PE and find min/max
         def get_pe_val(p):
             try:
                 pe_str = str(p.get("pe", "N/A")).replace("倍", "")
@@ -1535,31 +1535,54 @@ def fetch_peer_comparison(ticker: str, market: str, pe_ttm: str) -> list:
                 return 9999
         peers.sort(key=get_pe_val)
         
+        # Find min/max PE peers
+        valid_peers = [p for p in peers if get_pe_val(p) < 9999]
+        min_peer = valid_peers[0] if valid_peers else None
+        max_peer = valid_peers[-1] if valid_peers else None
+        
     except Exception as e:
         log_error("peer_comparison", str(e))
     
-    # If no peers, use default data
-    if not peers:
-        if market == "hk":
-            peers = [
-                {"name": "美的集团", "code": "00300.HK", "pe": "12-15", "peg": "—", "roe": "8-12%", "mcap": "5000亿+", "growth": "5-10%", "note": "家电龙头"},
-                {"name": "海尔智家", "code": "06690.HK", "pe": "15-18", "peg": "—", "roe": "15-20%", "mcap": "2500亿", "growth": "8-12%", "note": "全球化家电"},
-            ]
-        else:
-            peers = [
-                {"name": "禾盛新材", "code": "002290", "pe": "N/A", "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "note": "同行参考"},
-                {"name": "盾安环境", "code": "002011", "pe": "N/A", "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "note": "同行参考"},
-            ]
+    # Build result with benchmark + min/max peers
+    result = []
     
-    # Return benchmark data + peers
-    return [
-        {"name": "行业中位数", "code": "-", "pe": industry_median if industry_median != "N/A" else "25-35", 
-         "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "note": "汽车零部件（参考基准）"},
-        {"name": "最低估值", "code": "-", "pe": industry_min if industry_min != "N/A" else "10-18", 
-         "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "note": "🟢 行业最低PE"},
-        {"name": "最高估值", "code": "-", "pe": industry_max if industry_max != "N/A" else "40-60", 
-         "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "note": "🔴 行业最高PE"},
-    ] + peers
+    # Add industry median
+    median_str = industry_median if industry_median != "N/A" else ("25-35" if market != "hk" else "15-25")
+    result.append({
+        "name": "行业中位数", "code": "-", "pe": median_str,
+        "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "note": "汽车零部件（参考基准）"
+    })
+    
+    # Add min PE peer with actual data
+    if min_peer:
+        result.append({
+            "name": min_peer.get("name", "最低PE")[:8], "code": min_peer.get("code", "-"),
+            "pe": str(min_peer.get("pe", "N/A")), "peg": str(min_peer.get("peg", "N/A")),
+            "roe": str(min_peer.get("roe", "N/A")), "mcap": str(min_peer.get("mcap", "N/A")),
+            "growth": str(min_peer.get("growth", "N/A")), "note": "🟢 行业最低PE"
+        })
+    
+    # Add max PE peer with actual data (if different from min)
+    if max_peer and max_peer != min_peer:
+        result.append({
+            "name": max_peer.get("name", "最高PE")[:8], "code": max_peer.get("code", "-"),
+            "pe": str(max_peer.get("pe", "N/A")), "peg": str(max_peer.get("peg", "N/A")),
+            "roe": str(max_peer.get("roe", "N/A")), "mcap": str(max_peer.get("mcap", "N/A")),
+            "growth": str(max_peer.get("growth", "N/A")), "note": "🔴 行业最高PE"
+        })
+    
+    # Add separator
+    result.append({
+        "name": "────────", "code": "───", "pe": "───", "peg": "───",
+        "roe": "───", "mcap": "───", "growth": "───", "note": "─────────────────────────"
+    })
+    
+    # Add remaining peers (excluding min/max already shown)
+    for p in peers:
+        if p != min_peer and p != max_peer:
+            result.append(p)
+    
+    return result
 
 
 def fetch_catalysts(ticker: str, market: str) -> list:

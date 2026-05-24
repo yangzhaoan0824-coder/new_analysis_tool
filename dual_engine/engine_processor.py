@@ -398,7 +398,7 @@ class EngineProcessor:
                     break
             if latest_growth:
                 for peer in peers:
-                    if peer.get("name") == self.ticker or peer.get("note") == "当前标的":
+                    if peer.get("name") == "__CURRENT__" or peer.get("name") == self.ticker or peer.get("note") == "当前标的":
                         peer["profit_growth"] = latest_growth
                         break
 
