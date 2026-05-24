@@ -619,50 +619,104 @@ class ReportGenerator:
         # Peer comparison rows (US5: correct order + PE icon + insight)
         peer_rows = []
         median_pe = "N/A"
-        industry_desc = "汽车零部件（剔除亏损）"
+        min_pe = "N/A"
+        max_pe = "N/A"
+        industry_desc = "汽车零部件（参考基准）"
+        
+        # Collect industry benchmark data from peers
+        industry_peers = []
         for p in peers:
-            if "中位数" in str(p.get("name", "")) or "行业平均" in str(p.get("name", "")) or "行业" in str(p.get("name", "")):
-                median_pe = p.get("pe", "N/A")
-                if p.get("note"): industry_desc = str(p.get("note"))
-                break
+            name = str(p.get("name", ""))
+            if "中位数" in name:
+                median_pe = str(p.get("pe", "N/A"))
+                industry_desc = str(p.get("note", industry_desc))
+            elif "最低估值" in name:
+                min_pe = str(p.get("pe", "N/A"))
+            elif "最高估值" in name:
+                max_pe = str(p.get("pe", "N/A"))
+            elif name not in ("当前标的", "数据暂缺", "────────"):
+                industry_peers.append(p)
+        
+        # Add industry benchmark rows
         peer_rows.append({"name": "行业中位数", "pe": median_pe, "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "advantage": industry_desc})
-
+        peer_rows.append({"name": "最低估值", "pe": min_pe, "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "advantage": "🟢 行业最低PE"})
+        peer_rows.append({"name": "最高估值", "pe": max_pe, "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "advantage": "🔴 行业最高PE"})
+        peer_rows.append({"name": "────────", "pe": "───", "peg": "───", "roe": "───", "mcap": "───", "growth": "───", "advantage": "─────────────────────────"})
+        
         # Current stock: add PE comparison icon
         pe_compare_icon = ""
         try:
-            _cur_pe = float(actual_pe) if actual_pe not in ("-", "N/A") else None
-            _med_pe = float(median_pe) if median_pe not in ("N/A", "—") else None
+            _cur_pe = float(actual_pe.replace("倍", "")) if actual_pe not in ("-", "N/A") else None
+            # Try to parse median/min/max as ranges (e.g., "25-35")
+            def parse_range(val):
+                if not val or val in ("N/A", "—"):
+                    return None
+                if "-" in val:
+                    parts = val.split("-")
+                    try:
+                        return (float(parts[0]) + float(parts[1])) / 2
+                    except:
+                        return None
+                try:
+                    return float(val.replace("倍", ""))
+                except:
+                    return None
+            
+            _med_pe = parse_range(median_pe)
+            _min_pe = parse_range(min_pe)
+            _max_pe = parse_range(max_pe)
+            
             if _cur_pe is not None and _med_pe is not None:
-                if _cur_pe < _med_pe * 0.7: pe_compare_icon = "🟢 最低PE — "
+                if _cur_pe <= (_min_pe or 0) * 1.1: pe_compare_icon = "🟢 最低PE — "
                 elif _cur_pe < _med_pe: pe_compare_icon = "🟢 低PE — "
-                elif _cur_pe > _med_pe * 1.5: pe_compare_icon = "🔴 高PE — "
+                elif _cur_pe > _med_pe * 1.3: pe_compare_icon = "🔴 高PE — "
                 else: pe_compare_icon = "🟡 中等PE — "
         except: pass
         current_advantage = f"{pe_compare_icon}{industry_pos}" if pe_compare_icon else str(industry_pos)
         peer_rows.append({"name": r.name, "pe": actual_pe, "peg": peg_display, "roe": roe_display, "mcap": mcap_display, "growth": growth_display, "advantage": current_advantage})
 
-        # Add a comparison peer if available (exclude self)
+        # Add comparison peers (exclude self and benchmarks)
+        other_peers = []
         for p in peers:
             pn = str(p.get("name", ""))
             pn_ticker = str(p.get("ticker", ""))
-            is_self = pn == r.name or pn == ticker or pn_ticker == ticker or "行业" in pn or "中位数" in pn or "平均" in pn or "Sector" in pn
-            if is_self:
+            is_benchmark = any(x in pn for x in ["行业", "中位数", "平均", "最高", "最低", "───", "当前", "数据暂缺"])
+            is_self = pn == r.name or pn_ticker == ticker
+            if is_benchmark or is_self:
                 continue
+            other_peers.append(p)
+        
+        # Sort by PE
+        def get_pe_float(p):
+            try:
+                pe_str = str(p.get("pe", "N/A")).replace("倍", "")
+                if "-" in pe_str:
+                    parts = pe_str.split("-")
+                    return (float(parts[0]) + float(parts[1])) / 2
+                return float(pe_str) if pe_str not in ("N/A", "") else 9999
+            except:
+                return 9999
+        other_peers.sort(key=get_pe_float)
+        
+        for p in other_peers[:5]:  # Max 5 peers
+            pn = str(p.get("name", ""))
             peer_note = str(p.get("note", ""))
             peer_pe = str(p.get("pe", "N/A"))
             peer_pe_icon = ""
             try:
-                _ppe = float(peer_pe) if peer_pe not in ("N/A", "-") else None
-                _mpe = float(median_pe) if median_pe not in ("N/A", "—") else None
-                if _ppe is not None and _mpe is not None:
-                    if _ppe > _mpe * 1.3: peer_pe_icon = "🔴 高PE — "
-                    elif _ppe < _mpe * 0.7: peer_pe_icon = "🟢 低PE — "
+                _ppe = get_pe_float(p)
+                _med_pe = parse_range(median_pe)
+                _min_pe_val = parse_range(min_pe)
+                _max_pe_val = parse_range(max_pe)
+                if _ppe < 9999 and _med_pe is not None:
+                    if _ppe <= (_min_pe_val or 0) * 1.1: peer_pe_icon = "🟢 最低PE — "
+                    elif _ppe < _med_pe * 0.8: peer_pe_icon = "🟢 低PE — "
+                    elif _ppe > _med_pe * 1.3: peer_pe_icon = "🔴 高PE — "
                     else: peer_pe_icon = "🟡 中PE — "
             except: pass
             peer_adv = f"{peer_pe_icon}{peer_note}" if peer_pe_icon else peer_note
-            peer_rows.append({"name": pn, "pe": peer_pe, "peg": str(p.get("peg", "N/A")),
-                                  "roe": "N/A", "mcap": "N/A", "growth": "N/A", "advantage": peer_adv})
-            break
+            peer_rows.append({"name": pn[:8], "pe": peer_pe, "peg": str(p.get("peg", "N/A")),
+                                  "roe": str(p.get("roe", "N/A"))[:8], "mcap": str(p.get("mcap", "N/A"))[:8], "growth": str(p.get("growth", "N/A"))[:8], "advantage": peer_adv})
 
         for i, row in enumerate(peer_rows):
             report += f"│ {row['name'][:8]:>8} │ {row['pe']:>5} │ {row['peg']:>5} │ {row.get('roe','N/A'):>8} │ {row.get('mcap','N/A'):>8} │ {row.get('growth','N/A'):>8} │ {row['advantage'][:32]} │\n"

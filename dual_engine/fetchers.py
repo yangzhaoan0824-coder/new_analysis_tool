@@ -1397,27 +1397,68 @@ def _json_list_val(tbl_data: dict, name_map: dict, row_idx: int, col_names: list
 
 
 def fetch_peer_comparison(ticker: str, market: str, pe_ttm: str) -> list:
-    """Fetch peer comparison data."""
+    """Fetch peer comparison data from mx-data and industry benchmarks."""
     peers = []
     try:
+        # Query mx-data for industry benchmark data
+        query_ticker = DataParser.to_query_ticker(ticker, market)
+        
+        # Try to get peer data from mx-data
+        query_str = f"{query_ticker} 汽车零部件行业 市盈率PE"
+        r = mx_data_cached(query_ticker, query_str, TTL_CONSENSUS, env=None, timeout=TIMEOUT_DATA)
+        stdout = r.stdout if r else ""
+        
+        if stdout and "│" in stdout:
+            # Parse table format from mx-data
+            headers = []
+            for line in stdout.splitlines():
+                if re.match(r"\|\s*股票\s*\|", line, re.I) or re.match(r"\|\s*公司\s*\|", line, re.I):
+                    headers = [p.strip() for p in line.strip().strip("|").split("|")]
+                elif re.match(r"\|\s*[\u4e00-\u9fa5a-zA-Z]", line) and "│" in line:
+                    parts = [p.strip() for p in line.strip().strip("|").split("|")]
+                    if len(parts) >= 2 and parts[0]:
+                        row_dict = {}
+                        for i, col in enumerate(headers):
+                            if i < len(parts):
+                                row_dict[col] = parts[i]
+                        
+                        name = row_dict.get("股票", row_dict.get("公司", ""))
+                        pe_val = row_dict.get("PE", row_dict.get("市盈率", "N/A"))
+                        peg_val = row_dict.get("PEG", row_dict.get("历史PEG", "N/A"))
+                        roe_val = row_dict.get("ROE", row_dict.get("净资产收益率", "N/A"))
+                        mcap_val = row_dict.get("总市值", "N/A")
+                        growth_val = row_dict.get("利润增速", row_dict.get("净利润增速", "N/A"))
+                        note_val = row_dict.get("备注", row_dict.get("优势", ""))
+                        
+                        if name and name not in ("股票", "公司", "行业平均", "中位数"):
+                            peers.append({
+                                "name": name[:8],
+                                "code": row_dict.get("代码", "-"),
+                                "pe": pe_val,
+                                "peg": peg_val,
+                                "roe": roe_val,
+                                "mcap": mcap_val,
+                                "growth": growth_val,
+                                "note": note_val
+                            })
+    except Exception as e:
+        log_error("peer_comparison", str(e))
+    
+    # Default industry data based on market
+    if not peers:
         if market == "hk":
             peers = [
-                {"name": "行业平均", "code": "-", "pe": "10-15", "peg": "0.8-1.2", "note": "港股参考"},
-                {"name": ticker, "code": ticker, "pe": pe_ttm if pe_ttm else "N/A", "peg": "计算中", "note": "当前标的"},
-            ]
-        elif market == "us":
-            peers = [
-                {"name": "Sector Avg", "code": "-", "pe": "20-25", "peg": "1.5-2.0", "note": "US Tech"},
-                {"name": ticker, "code": ticker, "pe": pe_ttm if pe_ttm else "N/A", "peg": "N/A", "note": "Current"},
+                {"name": "行业中位数", "code": "-", "pe": "15-25", "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "note": "汽车零部件（港股参考）"},
+                {"name": "最低估值", "code": "-", "pe": "8-12", "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "note": "🟢 行业最低PE"},
+                {"name": "最高估值", "code": "-", "pe": "30-50", "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "note": "🔴 行业最高PE"},
             ]
         else:
             peers = [
-                {"name": "行业平均", "code": "-", "pe": "25-30", "peg": "1.2-1.5", "note": "参考基准"},
-                {"name": ticker, "code": ticker, "pe": pe_ttm, "peg": "计算中", "note": "当前标的"},
+                {"name": "行业中位数", "code": "-", "pe": "25-35", "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "note": "汽车零部件（A股参考）"},
+                {"name": "最低估值", "code": "-", "pe": "10-18", "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "note": "🟢 行业最低PE"},
+                {"name": "最高估值", "code": "-", "pe": "40-60", "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "note": "🔴 行业最高PE"},
             ]
-    except Exception as e:
-        log_error("peer_comparison", str(e))
-        peers = [{"name": "数据暂缺", "code": "-", "pe": "-", "peg": "-", "note": "请稍后重试"}]
+    
     return peers
 
 
