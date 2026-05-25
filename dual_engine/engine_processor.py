@@ -127,7 +127,8 @@ class EngineProcessor:
         print(f"   Step 2/5: 并行执行数据查询...")
         parallel_start = time.time()
 
-        mx_financial_data = {}  # Removed: fetch_financial_from_mx (us_financial_fetcher.py doesn't exist)
+        # 备用财务数据源（当前未使用，预留接口）
+        mx_financial_data = {}
 
         # Pass price_data to avoid redundant market_cap/PE queries
         _price_data_for_dedup = hk_price_data if self.market == "hk" else (a_price_data if self.market == "a" else None)
@@ -156,8 +157,6 @@ class EngineProcessor:
         company_profile = results.get("profile", {})
         earnings_forecast = results.get("forecast", {})
         ta_decision = results.get("ta", None)
-
-        # enrich_earnings_from_mx removed: mx_financial_data is always empty (us_financial_fetcher.py missing)
 
         print(f"   ✅ 并行任务完成 ({time.time()-parallel_start:.1f}秒)")
 
