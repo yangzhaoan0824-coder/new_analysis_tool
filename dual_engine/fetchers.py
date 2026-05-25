@@ -1467,11 +1467,12 @@ def fetch_peer_comparison(ticker: str, market: str, pe_ttm: str) -> list:
     # Show: median + min + max + up to 2 additional peers for context
     result = []
 
-    # Add industry median
-    median_str = industry_median if industry_median != "N/A" else ("25-35" if market != "hk" else "15-25")
+    # Add industry median (only if actually retrieved from mx-data)
+    median_str = industry_median if industry_median != "N/A" else "N/A"
+    note = "汽车零部件（参考基准）" if industry_median != "N/A" else "行业中位数待查询"
     result.append({
         "name": "行业中位数", "code": "-", "pe": median_str,
-        "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "note": "汽车零部件（参考基准）"
+        "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "note": note
     })
 
     # Add min/max PE peers
@@ -1638,7 +1639,7 @@ def fetch_gs_financial_metrics(ticker: str, market: str, price_data: dict = None
                     break
 
         if metrics["beta"] == "N/A":
-            metrics["beta"] = {"a": "1.15", "hk": "1.05"}.get(market, "1.10")
+            metrics["beta"] = "N/A"
 
         # Parse query 3: Forward PE / PEG
         # mx-data returns years in descending order (2028, 2027, 2026)
@@ -1819,6 +1820,239 @@ def save_to_notion(ticker: str, report_text: str):
             print(f"   ⚠️ Notion 存档失败: {result.stderr.strip()[:100]}")
     except Exception as e:
         print(f"   ⚠️ Notion 存档失败: {e}")
+
+
+def fetch_quarterly_data(ticker: str, market: str) -> dict:
+    """Fetch the latest quarterly (Q1) financial data from mx-data.
+
+    Returns dict:
+        revenue_q: str or None       — 营收（亿元）
+        net_profit_q: str or None    — 归母净利润（亿元）
+        revenue_yoy_q: str or None   — 营收同比
+        net_profit_yoy_q: str or None— 净利润同比
+        quarter_label: str           — e.g. "2026Q1"
+        segment_data: list[dict]    — [{name, revenue}] 分业务板块数据
+    """
+    result = {
+        "revenue_q": None, "net_profit_q": None,
+        "revenue_yoy_q": None, "net_profit_yoy_q": None,
+        "quarter_label": "", "segment_data": []
+    }
+    try:
+        query_ticker = DataParser.to_query_ticker(ticker, market)
+        unit = "港元" if market == "hk" else "元"
+
+        # Build env with MX_APIKEY
+        env = dict(os.environ)
+        env_file = os.path.join(DAILY_ANALYSIS_DIR, ".env")
+        try:
+            with open(env_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("MX_APIKEY") and "=" in line:
+                        k, v = line.split("=", 1)
+                        env[k.strip()] = v.strip()
+        except Exception:
+            pass
+
+        r = mx_data_cached(
+            query_ticker,
+            f"{query_ticker} 营业总收入 归母净利润 同比 季度",
+            TTL_EARNINGS,
+            env=env, timeout=TIMEOUT_DATA
+        )
+
+        headers = []
+        latest_quarter = None
+        latest_idx = 0
+
+        for line in r.stdout.splitlines():
+            if re.match(r"\|\s*date\s*\|", line, re.I):
+                headers = [p.strip() for p in line.strip().strip("|").split("|")]
+            elif re.match(r"\|\s*\d{4}[-/]\d{2}", line):
+                parts = [p.strip() for p in line.strip().strip("|").split("|")]
+                if parts and headers:
+                    date_str = parts[0]
+                    # Pick latest quarter row
+                    if not latest_quarter or date_str > latest_quarter:
+                        latest_quarter = date_str
+                        latest_idx = 0  # will be updated below
+
+        # Re-parse to get latest row with column mapping
+        for line in r.stdout.splitlines():
+            if re.match(r"\|\s*date\s*\|", line, re.I):
+                headers = [p.strip() for p in line.strip().strip("|").split("|")]
+            elif re.match(r"\|\s*\d{4}[-/]\d{2}", line):
+                parts = [p.strip() for p in line.strip().strip("|").split("|")]
+                if not parts or len(parts) < 2:
+                    continue
+                date_str = parts[0]
+                if date_str != latest_quarter:
+                    continue
+                col_map = {}
+                for i, col in enumerate(headers):
+                    if i < len(parts):
+                        col_map[col] = parts[i]
+
+                # Revenue
+                rev_raw = col_map.get("营业总收入(元)") or col_map.get("营业收入") \
+                          or col_map.get("营业总收入")
+                if rev_raw and rev_raw != "-":
+                    m = re.search(r"([\d.]+)", rev_raw)
+                    if m:
+                        val = float(m.group(1))
+                        # Convert 元 → 亿元
+                        result["revenue_q"] = f"{val / 1e8:.2f}"
+
+                # Net profit
+                np_raw = col_map.get("归母净利润(元)") or col_map.get("净利润") \
+                         or col_map.get("归母净利润")
+                if np_raw and np_raw != "-":
+                    m = re.search(r"([\d.]+)", np_raw)
+                    if m:
+                        val = float(m.group(1))
+                        result["net_profit_q"] = f"{val / 1e8:.2f}"
+
+                # Revenue YoY
+                rg_raw = col_map.get("营业总收入增长率(%)") or col_map.get("营收同比增长率") \
+                         or col_map.get("营业收入增长率")
+                if rg_raw and rg_raw != "-":
+                    m = re.search(r"([\-\d.]+)", rg_raw)
+                    if m:
+                        result["revenue_yoy_q"] = f"{m.group(1)}%"
+
+                # Net profit YoY
+                pg_raw = col_map.get("归母净利润增长率(%)") or col_map.get("利润同比增长率") \
+                         or col_map.get("净利润增长率")
+                if pg_raw and pg_raw != "-":
+                    m = re.search(r"([\-\d.]+)", pg_raw)
+                    if m:
+                        result["net_profit_yoy_q"] = f"{m.group(1)}%"
+
+                # Quarter label
+                qm = re.search(r"(\d{4})[-/](\d{2})", date_str)
+                if qm:
+                    year, month = int(qm.group(1)), int(qm.group(2))
+                    quarter = (month - 1) // 3 + 1
+                    result["quarter_label"] = f"{year}Q{quarter}"
+                else:
+                    result["quarter_label"] = latest_quarter[:7] if latest_quarter else ""
+                break
+
+        # Fallback: if quarterly data still empty, try the raw JSON
+        if not result["revenue_q"]:
+            _try_parse_quarterly_json(f"{query_ticker} 营业总收入 归母净利润 同比 季度", result)
+
+    except Exception as e:
+        log_error("quarterly_data", str(e))
+
+    return result
+
+
+def _try_parse_quarterly_json(query_str: str, result: dict) -> None:
+    """Fallback: parse mx-data raw JSON for quarterly data."""
+    path = find_latest_raw_json(query_str, max_age=86400)
+    if not path:
+        return
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    d = _navigate_mx_data_json(raw)
+    if not isinstance(d, dict):
+        return
+    sr = d.get("searchDataResultDTO")
+    if not sr or not isinstance(sr, dict):
+        return
+    tables = sr.get("dataTableDTOList", [])
+    for tbl in tables:
+        if not isinstance(tbl, dict):
+            continue
+        name_map = tbl.get("nameMap", {})
+        tbl_data = tbl.get("table", {})
+        if not name_map or not isinstance(tbl_data, dict):
+            continue
+        head_names = tbl_data.get("headName", [])
+        if not head_names:
+            continue
+        # Use the first (most recent) column
+        row_idx = 0
+
+        def _get(col_names: list) -> str:
+            for cn in col_names:
+                for fk, fn in name_map.items():
+                    if fn == cn and fk in tbl_data:
+                        vals = tbl_data[fk]
+                        if isinstance(vals, list) and row_idx < len(vals):
+                            return str(vals[row_idx]) if vals[row_idx] else ""
+            return ""
+
+        rev_raw = _get(["营业总收入(元)", "营业收入", "营业总收入"])
+        if rev_raw and rev_raw not in ("-", "N/A"):
+            m = re.search(r"([\d.]+)", rev_raw)
+            if m:
+                result["revenue_q"] = f"{float(m.group(1)) / 1e8:.2f}"
+
+        np_raw = _get(["归母净利润(元)", "净利润", "归母净利润"])
+        if np_raw and np_raw not in ("-", "N/A"):
+            m = re.search(r"([\d.]+)", np_raw)
+            if m:
+                result["net_profit_q"] = f"{float(m.group(1)) / 1e8:.2f}"
+
+        rg_raw = _get(["营业总收入增长率(%)", "营收同比增长率"])
+        if rg_raw and rg_raw not in ("-", "N/A"):
+            m = re.search(r"([\-\d.]+)", rg_raw)
+            if m:
+                result["revenue_yoy_q"] = f"{m.group(1)}%"
+
+        pg_raw = _get(["归母净利润增长率(%)", "利润同比增长率"])
+        if pg_raw and pg_raw not in ("-", "N/A"):
+            m = re.search(r"([\-\d.]+)", pg_raw)
+            if m:
+                result["net_profit_yoy_q"] = f"{m.group(1)}%"
+
+        date_raw = _get(["date", "日期"])
+        if date_raw and not result["quarter_label"]:
+            qm = re.search(r"(\d{4})[-/](\d{2})", date_raw)
+            if qm:
+                year, month = int(qm.group(1)), int(qm.group(2))
+                result["quarter_label"] = f"{year}Q{(month - 1) // 3 + 1}"
+
+
+def fetch_concept_tags(ticker: str, market: str) -> str:
+    """Fetch concept/tag strings from mx-data 所属行业板块 query.
+
+    Returns a pipe-separated tag string, e.g. "机器人概念 | 新能源汽车 | 医疗器械"
+    or "" if not available.
+    """
+    try:
+        query_ticker = DataParser.to_query_ticker(ticker, market)
+        r = mx_data_cached(
+            query_ticker, f"{query_ticker} 所属行业板块 概念",
+            TTL_PROFILE, timeout=TIMEOUT_DATA
+        )
+        tags = []
+        seen = set()
+        for line in r.stdout.splitlines():
+            if not line.strip() or line.startswith("| date") or line.startswith("---"):
+                continue
+            # Match concept/industry words
+            parts = line.strip().strip("|").split("|")
+            for p in parts:
+                p = p.strip()
+                if not p or p == "-" or p in seen:
+                    continue
+                if any(p.startswith(kw) for kw in ("机器人", "新能源", "人工智能", "智能", "医疗", "汽车", "家电", "热管理", "电子", "半导体", "储能", "汽车零部件", "汽车热管理", "液冷", "冷链")):
+                    if len(p) < 20 and p not in seen:
+                        tags.append(p)
+                        seen.add(p)
+                elif re.search(r"[\u4e00-\u9fff]{3,8}", p) and len(p) < 12 and p not in seen:
+                    # Generic Chinese tag: 3-8 chars, not already seen
+                    tags.append(p)
+                    seen.add(p)
+        if tags:
+            return " | ".join(tags[:6])
+    except Exception as e:
+        log_error("concept_tags", str(e))
+    return ""
 
 
 def fetch_revenue_composition(ticker: str, market: str, revenue_split: str = "") -> dict:

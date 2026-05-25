@@ -37,6 +37,7 @@ from dual_engine.fetchers import (
     fetch_company_profile, fetch_earnings_forecast, fetch_peer_comparison,
     fetch_catalysts, fetch_gs_financial_metrics, fetch_revenue_composition,
     save_to_investment_db, save_to_notion,
+    fetch_quarterly_data, fetch_concept_tags,
 )
 
 getcontext().prec = 28
@@ -133,12 +134,14 @@ class EngineProcessor:
         # Pass price_data to avoid redundant market_cap/PE queries
         _price_data_for_dedup = hk_price_data if self.market == "hk" else (a_price_data if self.market == "a" else None)
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        with ThreadPoolExecutor(max_workers=7) as executor:
             futures = {
                 executor.submit(fetch_news_via_mx_search, self.ticker, r.name if hasattr(r, 'name') else ""): "news",
                 executor.submit(run_weekly_check, self.ticker, self.market): "weekly",
                 executor.submit(fetch_company_profile, self.ticker, self.market, _price_data_for_dedup): "profile",
                 executor.submit(fetch_earnings_forecast, self.ticker, self.market): "forecast",
+                executor.submit(fetch_quarterly_data, self.ticker, self.market): "quarterly",
+                executor.submit(fetch_concept_tags, self.ticker, self.market): "concepts",
             }
             if self.market == "us":
                 futures[executor.submit(run_trading_agents, self.ticker)] = "ta"
@@ -157,6 +160,8 @@ class EngineProcessor:
         company_profile = results.get("profile", {})
         earnings_forecast = results.get("forecast", {})
         ta_decision = results.get("ta", None)
+        quarterly_data = results.get("quarterly", {}) or {}
+        concept_tags = results.get("concepts", "") or ""
 
         print(f"   ✅ 并行任务完成 ({time.time()-parallel_start:.1f}秒)")
 
@@ -290,6 +295,8 @@ class EngineProcessor:
             "hk_price_data": hk_price_data,
             "a_price_data": a_price_data,
             "composite": composite_result,
+            "quarterly_data": quarterly_data,
+            "concept_tags": concept_tags,
             "elapsed_seconds": time.time() - start_time,
         }
 

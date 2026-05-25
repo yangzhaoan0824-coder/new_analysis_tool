@@ -274,7 +274,7 @@ class ReportGenerator:
 
         roe_val = gs_metrics.get('roe', 'N/A')
         fy1_roe = gs_metrics.get('forecast_roe_fy1', 'N/A')
-        if roe_val != 'N/A' and fy1_roe != 'N/A':
+        if roe_val != 'N/A' and fy1_roe != 'N/A' and roe_val != fy1_roe:
             fundamental_interp = f"ROE {roe_val}偏低，但预测FY1 {fy1_roe}改善中"
         elif roe_val != 'N/A':
             fundamental_interp = f"ROE {roe_val}偏低拖累，但改善趋势明确"
@@ -463,8 +463,21 @@ class ReportGenerator:
             except:
                 pass
 
-        # Beta
-        beta_interp = "🔵 中高波动" if gs_metrics['beta'] != 'N/A' else "🔵 中高波动 (默认值)"
+        # Beta — no hardcoded default, only show when actually retrieved
+        beta_val = gs_metrics['beta']
+        if beta_val != 'N/A':
+            try:
+                beta_num = float(beta_val)
+                if beta_num > 1.5:
+                    beta_interp = "🔵 高波动性（β>1.5）"
+                elif beta_num > 1.0:
+                    beta_interp = "🔵 中高波动（β>1.0）"
+                else:
+                    beta_interp = "🟢 低波动（β≤1.0）"
+            except:
+                beta_interp = "🔵 中高波动"
+        else:
+            beta_interp = "⚪ 待查询"
 
         # Market cap
         market_cap_display = self.results.get("market_cap", "N/A")
@@ -522,6 +535,25 @@ class ReportGenerator:
 
         peg_fy1 = gs_metrics.get('forecast_peg_fy1', peg_display)
 
+        # ── Quarterly data from fetch_quarterly_data ──────────────────────────────
+        qdata = self.results.get("quarterly_data") or {}
+        q_label = qdata.get("quarter_label", "最新季度")
+        q_rev = qdata.get("revenue_q")
+        q_np = qdata.get("net_profit_q")
+        q_rev_yoy = qdata.get("revenue_yoy_q")
+        q_np_yoy = qdata.get("net_profit_yoy_q")
+
+        def _qdisp(val: str | None) -> str:
+            return f"{val} 亿元" if val else "N/A"
+
+        def _qoyd(val: str | None) -> str:
+            return val if val else "N/A"
+
+        quarterly_rows = (
+            f"│ 营收         │ {_qdisp(q_rev):>8} │ {_qoyd(q_rev_yoy):>8} │\n"
+            f"│ 归母净利润   │ {_qdisp(q_np):>8} │ {_qoyd(q_np_yoy):>8} │"
+        )
+
         return f"""📊 财务预测与核心指标 (GS Data)
 
 ┌────────┬──────────┬──────────┬────────────┬────────────────┬────────┬─────────┬──────────┐
@@ -530,15 +562,12 @@ class ReportGenerator:
 {chr(10).join(rows)}
 └────────┴──────────┴──────────┴────────────┴────────────────┴────────┴─────────┴──────────┘
 
-**2026Q1 最新季度数据**：
+**{q_label} 最新季度数据**：
 
 ┌──────────────┬──────────┬──────────┐
 │ 指标         │   数值   │   同比   │
 ├──────────────┼──────────┼──────────┤
-│ 营收         │   N/A   │   N/A   │
-│ 归母净利润   │   N/A   │   N/A   │
-│ 汽零收入     │   N/A   │   N/A   │
-│ 制冷收入     │   N/A   │   N/A   │
+{quarterly_rows}
 └──────────────┴──────────┴──────────┘
 
 > 注：季度数据来自公司季报，请以实际披露为准
@@ -557,7 +586,7 @@ class ReportGenerator:
 ├─────────────────┼──────────┼──────────────────────┤
 │ PEG(FY1)        │ {peg_fy1:>8} │ {peg_interp} │
 ├─────────────────┼──────────┼──────────────────────┤
-│ Beta            │ {gs_metrics['beta']:>8} │ {beta_interp} │
+│ Beta            │ {beta_val:>8} │ {beta_interp} │
 ├─────────────────┼──────────┼──────────────────────┤
 │ 总市值          │ {market_cap_display:>8} │ {market_label}{mcap_size}              │
 └─────────────────┴──────────┴──────────────────────┘
@@ -683,13 +712,16 @@ class ReportGenerator:
         _customers = company_profile.get('key_customers', '') or ''
         customers_block = f"- **核心客户**：{_customers}" if _customers else ""
 
-        # Concept tags
-        if market == "hk":
+        # Concept tags — prefer dynamic from mx-data, fallback to market-specific defaults
+        concept_tags_raw = self.results.get("concept_tags", "") or ""
+        if concept_tags_raw:
+            concept_tags = concept_tags_raw
+        elif market == "hk":
             concept_tags = "仓储机器人 | AMR解决方案 | 智慧物流 | AI机器人 | 港股"
         elif market == "us":
             concept_tags = "科技股 | AI | 机器人 | 自动化"
         else:
-            concept_tags = "机器人 | 人工智能 | 智慧物流 | 自动化"
+            concept_tags = "机器人概念 | 汽车热管理 | 制冷空调 | 自动化"
 
         return f"""📐 行业对标与估值
 
@@ -789,8 +821,20 @@ class ReportGenerator:
             mcap_size = self.results["market_label"]
 
         sentiment_icon = "🔴 高" if r.sentiment_score < 40 else "🟡 中"
-        liquidity_text = "港股通成交偏淡，做空机制风险" if market == "hk" else "中小盘股，成交偏淡，机构持仓比例较低"
-        fund_text = "南向资金波动影响股价" if market == "hk" else "美元收入占比高，汇兑损失风险"
+
+        # Fix 6: Dynamic liquidity/fund risk text based on market cap size + market
+        if market == "hk":
+            liquidity_text = "港股通成交偏淡，做空机制存在风险"
+            fund_text = "南向资金波动影响股价"
+        elif mcap_size == "大盘":
+            liquidity_text = "大盘蓝筹，流动性好，机构持仓稳定"
+            fund_text = "人民币汇率波动对营收有一定影响"
+        elif mcap_size == "中小盘":
+            liquidity_text = "中小盘股，成交相对清淡，机构持仓比例有限"
+            fund_text = "美元收入占比高，汇兑损失风险"
+        else:
+            liquidity_text = "小盘股，流动性偏低，换手率波动较大"
+            fund_text = "营收结构待确认，关注汇率敞口"
 
         return f"""⚠️ 风险评估
 
@@ -936,6 +980,21 @@ class ReportGenerator:
             trade_logic = investment_thesis if investment_thesis else "技术面信号为主，等待方向确认"
             trade_logic_line2 = ""
 
+        # Fix 7: Dynamic long-term thresholds based on current price and target price
+        if target_price_num and current_price and target_price_num > current_price:
+            # Discount entry: buy when price is N% below target
+            discount_pct = (target_price_num - current_price) / target_price_num * 100
+            # PE at entry price
+            pe_ttm = self.composite.get("pe_ttm", "")
+            try:
+                pe_num = float(str(pe_ttm).replace("倍", "")) if pe_ttm not in ("N/A", "") else None
+                pe_entry = f"PE≈{pe_num:.0f}x" if pe_num else "PE待确认"
+            except:
+                pe_entry = "PE待确认"
+            long_term_entry = f"目标价以下{discount_pct:.0f}%建仓（{pe_entry}）"
+        else:
+            long_term_entry = "目标价附近或以下建仓，关注估值合理性"
+
         return f"""🎯 今日操作建议
 
 ┌──────────┬──────────────────────────────────────────┐
@@ -956,7 +1015,7 @@ class ReportGenerator:
 ┌──────────┬──────────────────────────────────────────┐
 │ 操作     │ 条件                                     │
 ├──────────┼──────────────────────────────────────────┤
-│ 等待回调 │ 目标价以下N%建仓（PE~Nx）                │
+│ 等待回调 │ {long_term_entry}              │
 │ 分批建仓 │ 跌破关键支撑位时分批加仓                  │
 │ 减仓     │ 突破关键阻力位且无业绩支撑时减仓          │
 └──────────┴──────────────────────────────────────────┘
