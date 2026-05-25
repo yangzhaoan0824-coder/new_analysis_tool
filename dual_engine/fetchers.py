@@ -23,6 +23,9 @@ from dual_engine.constants import (
 from dual_engine.utils import log_error, detect_market, _load_zshrc_env
 from dual_engine.data_parser import DataParser
 from dual_engine.cache import mx_data_cached, TTL_CONSENSUS, TTL_PROFILE, TTL_EARNINGS, TTL_WEEKLY, TTL_GS_METRICS
+from dual_engine.mx_table_parser import (
+    find_latest_raw_json, parse_stdout_table, parse_latest_row, strip_unit,
+)
 
 
 def _navigate_mx_data_json(raw: dict) -> dict:
@@ -199,58 +202,44 @@ def fetch_analyst_rating(ticker: str, market: str) -> dict:
 
 def _try_parse_rating_json(query_str: str, result: dict) -> None:
     """Fallback: parse mx-data raw JSON for analyst rating."""
-    try:
-        import glob as _glob
-        safe_query = query_str.replace(" ", "_")
-        pattern = os.path.expanduser(
-            f"~/.openclaw/workspace/mx_data/output/mx_data_{safe_query}_raw.json"
-        )
-        files = _glob.glob(pattern)
-        if not files:
-            return
-        latest = max(files, key=os.path.getmtime)
-        if os.path.getmtime(latest) < time.time() - 120:
-            return
-        with open(latest, encoding="utf-8") as f:
-            raw = json.load(f)
-        d = _navigate_mx_data_json(raw)
-        if not isinstance(d, dict):
-            return
-        sr = d.get("searchDataResultDTO")
-        if not sr or not isinstance(sr, dict):
-            return
-        tables = sr.get("dataTableDTOList", [])
-        for tbl in tables:
-            if not isinstance(tbl, dict):
+    path = find_latest_raw_json(query_str, max_age=120)
+    if not path:
+        return
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    d = _navigate_mx_data_json(raw)
+    if not isinstance(d, dict):
+        return
+    sr = d.get("searchDataResultDTO")
+    if not sr or not isinstance(sr, dict):
+        return
+    tables = sr.get("dataTableDTOList", [])
+    for tbl in tables:
+        if not isinstance(tbl, dict):
+            continue
+        name_map = tbl.get("nameMap", {})
+        tbl_data = tbl.get("table", {})
+        if not name_map or not isinstance(tbl_data, dict):
+            continue
+        for field_key, col_name in name_map.items():
+            if field_key in ("headNameSub",) or not col_name:
                 continue
-            name_map = tbl.get("nameMap", {})
-            tbl_data = tbl.get("table", {})
-            if not name_map or not isinstance(tbl_data, dict):
+            vals = tbl_data.get(field_key, [])
+            if not isinstance(vals, list):
                 continue
-            head_names = tbl_data.get("headName", [])
-            if not isinstance(head_names, list):
+            val = None
+            for v in reversed(vals):
+                if v and str(v).strip() and str(v).strip() != "-":
+                    val = str(v).strip()
+                    break
+            if not val:
                 continue
-            for field_key, col_name in name_map.items():
-                if field_key == "headNameSub" or not col_name:
-                    continue
-                vals = tbl_data.get(field_key, [])
-                if not isinstance(vals, list):
-                    continue
-                val = None
-                for v in reversed(vals):
-                    if v and str(v).strip() and str(v).strip() != "-":
-                        val = str(v).strip()
-                        break
-                if not val:
-                    continue
-                if "综合评级" in col_name and not result["rating"]:
-                    result["rating"] = val
-                elif "机构总家数" in col_name and not result["count"]:
-                    m = re.search(r"(\d+)", val)
-                    if m:
-                        result["count"] = int(m.group(1))
-    except Exception:
-        pass
+            if "综合评级" in col_name and not result["rating"]:
+                result["rating"] = val
+            elif "机构总家数" in col_name and not result["count"]:
+                m = re.search(r"(\d+)", val)
+                if m:
+                    result["count"] = int(m.group(1))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -289,91 +278,73 @@ def _parse_a_tech_json(query_str: str, tech_data: dict) -> None:
     RSI, MACD columns regardless of table ordering.
     """
     import json as _json
-    import glob as _glob
 
-    try:
-        # Find the raw JSON output file — match loosely since mx-data
-        # preserves special chars (dots) in filenames
-        output_dir = os.path.expanduser("~/.openclaw/workspace/mx_data/output")
-        safe_prefix = re.sub(r'[\s]+', '_', query_str)
-        pattern = os.path.join(output_dir, f"mx_data_{safe_prefix}_raw.json")
-        candidates = _glob.glob(pattern)
-        # Also try with dots replaced by underscores
-        if not candidates:
-            alt_prefix = re.sub(r'[^\w]', '_', query_str)
-            pattern2 = os.path.join(output_dir, f"mx_data_{alt_prefix}_raw.json")
-            candidates = _glob.glob(pattern2)
-        if not candidates:
-            return
+    path = find_latest_raw_json(query_str, max_age=86400)
+    if not path:
+        return
 
-        latest = max(candidates, key=os.path.getmtime)
-        if os.path.getmtime(latest) < time.time() - 86400:
-            return
+    with open(path, "r", encoding="utf-8") as f:
+        raw = _json.load(f)
 
-        with open(latest, "r", encoding="utf-8") as f:
-            raw = _json.load(f)
+    tables = (
+        raw.get("raw", raw)
+        .get("data", {})
+        .get("data", {})
+        .get("searchDataResultDTO", {})
+        .get("dataTableDTOList", [])
+    )
+    if not tables:
+        return
 
-        tables = (
-            raw.get("raw", raw)
-            .get("data", {})
-            .get("data", {})
-            .get("searchDataResultDTO", {})
-            .get("dataTableDTOList", [])
-        )
-        if not tables:
-            return
+    # Build a unified name→values map across all tables
+    for tbl in tables:
+        name_map = tbl.get("nameMap", {})
+        table = tbl.get("table", {})
+        head_names = table.get("headName", [])
 
-        # Build a unified name→values map across all tables
-        for tbl in tables:
-            name_map = tbl.get("nameMap", {})
-            table = tbl.get("table", {})
-            head_names = table.get("headName", [])
+        # Determine the row index for the latest date
+        latest_idx = 0
+        for idx, hn in enumerate(head_names):
+            hn_str = str(hn).strip()
+            if not tech_data.get("date") or hn_str > tech_data["date"]:
+                latest_idx = idx
+                # Don't break — keep looking for even newer dates
 
-            # Determine the row index for the latest date
-            latest_idx = 0
-            for idx, hn in enumerate(head_names):
-                hn_str = str(hn).strip()
-                if not tech_data.get("date") or hn_str > tech_data["date"]:
-                    latest_idx = idx
-                    # Don't break — keep looking for even newer dates
+        # Map field codes to semantic keys using nameMap
+        for field_code, display_name in name_map.items():
+            if field_code in ("headNameSub",) or field_code == "headName":
+                continue
+            vals = table.get(field_code, [])
+            if not vals or latest_idx >= len(vals):
+                continue
+            val_str = str(vals[latest_idx]).strip()
+            if not val_str or val_str in ("-", "N/A"):
+                continue
+            m = re.search(r"([\-\d.]+)", val_str)
+            if not m:
+                continue
+            val = float(m.group(1))
 
-            # Map field codes to semantic keys using nameMap
-            for field_code, display_name in name_map.items():
-                if field_code in ("headNameSub",) or field_code == "headName":
-                    continue
-                vals = table.get(field_code, [])
-                if not vals or latest_idx >= len(vals):
-                    continue
-                val_str = str(vals[latest_idx]).strip()
-                if not val_str or val_str in ("-", "N/A"):
-                    continue
-                m = re.search(r"([\-\d.]+)", val_str)
-                if not m:
-                    continue
-                val = float(m.group(1))
+            # Map display_name to semantic keys
+            dn_lower = display_name.lower()
+            if "5日" in display_name or "ma5" in dn_lower or "5日ma" in dn_lower:
+                tech_data["ma5"] = val
+            elif "20日" in display_name or "ma20" in dn_lower or "20日ma" in dn_lower:
+                tech_data["ma20"] = val
+            elif "rsi" in dn_lower:
+                tech_data["rsi"] = val
+            elif "dif" in dn_lower:
+                tech_data["macd_diff"] = val
+            elif "dea" in dn_lower:
+                tech_data["macd_dea"] = val
+            elif "柱状" in display_name or "macd柱" in dn_lower or "histogram" in dn_lower:
+                tech_data["macd_histogram"] = val
 
-                # Map display_name to semantic keys
-                dn_lower = display_name.lower()
-                if "5日" in display_name or "ma5" in dn_lower or "5日ma" in dn_lower:
-                    tech_data["ma5"] = val
-                elif "20日" in display_name or "ma20" in dn_lower or "20日ma" in dn_lower:
-                    tech_data["ma20"] = val
-                elif "rsi" in dn_lower:
-                    tech_data["rsi"] = val
-                elif "dif" in dn_lower:
-                    tech_data["macd_diff"] = val
-                elif "dea" in dn_lower:
-                    tech_data["macd_dea"] = val
-                elif "柱状" in display_name or "macd柱" in dn_lower or "histogram" in dn_lower:
-                    tech_data["macd_histogram"] = val
-
-            # Update date from headName
-            if head_names and latest_idx < len(head_names):
-                hn_str = str(head_names[latest_idx]).strip()[:10]
-                if hn_str > tech_data.get("date", ""):
-                    tech_data["date"] = hn_str
-    except Exception:
-        pass  # Best-effort; don't crash the main flow
+        # Update date from headName
+        if head_names and latest_idx < len(head_names):
+            hn_str = str(head_names[latest_idx]).strip()[:10]
+            if hn_str > tech_data.get("date", ""):
+                tech_data["date"] = hn_str
 
 
 def run_daily_analysis(ticker: str):
@@ -700,17 +671,9 @@ def _calc_5day_change(query_ticker: str) -> Optional[float]:
         if not daily_changes:
             # Fallback: try JSON
             query_str = f"{query_ticker} 区间涨跌幅"
-            safe_query = query_str.replace(" ", "_")
-            pattern = os.path.expanduser(
-                f"~/.openclaw/workspace/mx_data/output/mx_data_{safe_query}_raw.json"
-            )
-            import glob as _glob
-            files = _glob.glob(pattern)
-            if files:
-                latest = max(files, key=os.path.getmtime)
-                if os.path.getmtime(latest) < time.time() - 120:
-                    return None
-                with open(latest, encoding="utf-8") as f:
+            path = find_latest_raw_json(query_str, max_age=120)
+            if path:
+                with open(path, encoding="utf-8") as f:
                     raw = json.load(f)
                 d = _navigate_mx_data_json(raw)
                 if isinstance(d, dict):
@@ -752,97 +715,69 @@ def _calc_5day_change(query_ticker: str) -> Optional[float]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _try_parse_mx_json(query_str: str, price_data: dict) -> None:
-    """Fallback: parse mx-data raw JSON file when stdout parsing misses price.
+    """Fallback: parse mx-data raw JSON file when stdout parsing misses price."""
+    path = find_latest_raw_json(query_str, max_age=120)
+    if not path:
+        return
 
-    mx-data may output multiple tables; pipe buffering can truncate stdout
-    so only the first table is captured.  This reads the _raw.json file that
-    mx-data writes to disk, navigates its nested structure, and extracts
-    the same price fields.
-    """
-    try:
-        import json as _json
-        import glob as _glob
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
 
-        # Build filename prefix from query string (same pattern mx-data uses)
-        safe_query = query_str.replace(" ", "_")
-        pattern = os.path.expanduser(
-            f"~/.openclaw/workspace/mx_data/output/mx_data_{safe_query}_raw.json"
-        )
-        files = _glob.glob(pattern)
-        if not files:
-            return
-        latest = max(files, key=os.path.getmtime)
+    # Navigate nested data structure: raw -> data -> ... -> searchDataResultDTO
+    d = _navigate_mx_data_json(raw)
 
-        # Only consider files modified within last 120 seconds
-        if os.path.getmtime(latest) < time.time() - 120:
-            return
+    if not isinstance(d, dict):
+        return
+    sr = d.get("searchDataResultDTO")
+    if not sr or not isinstance(sr, dict):
+        return
+    tables = sr.get("dataTableDTOList", [])
 
-        with open(latest, encoding="utf-8") as f:
-            raw = _json.load(f)
+    for tbl in tables:
+        if not isinstance(tbl, dict):
+            continue
+        name_map = tbl.get("nameMap", {})
+        tbl_data = tbl.get("table", {})
+        if not name_map or not isinstance(tbl_data, dict):
+            continue
 
-        # Navigate nested data structure: raw -> data -> ... -> searchDataResultDTO
-        d = _navigate_mx_data_json(raw)
+        # Determine the index of the latest date from headName/headNameSub
+        head_names = tbl_data.get("headName") or tbl_data.get("headNameSub") or []
+        latest_idx = 0
+        if head_names:
+            try:
+                latest_idx = max(range(len(head_names)),
+                                 key=lambda i: str(head_names[i]).replace("(日)", "").strip())
+            except Exception:
+                latest_idx = 0
 
-        if not isinstance(d, dict):
-            return
-        sr = d.get("searchDataResultDTO")
-        if not sr or not isinstance(sr, dict):
-            return
-        tables = sr.get("dataTableDTOList", [])
-
-        for tbl in tables:
-            if not isinstance(tbl, dict):
+        for field_key, col_name in name_map.items():
+            if field_key in ("headNameSub", "headName"):
                 continue
-            name_map = tbl.get("nameMap", {})
-            tbl_data = tbl.get("table", {})
-            if not name_map or not isinstance(tbl_data, dict):
+            vals = tbl_data.get(field_key)
+            if not vals or not isinstance(vals, list):
                 continue
-
-            # Determine the index of the latest date from headName/headNameSub
-            # mx-data lists dates oldest-first; pick the row with the most recent date
-            head_names = tbl_data.get("headName") or tbl_data.get("headNameSub") or []
-            latest_idx = 0
-            if head_names:
-                try:
-                    latest_idx = max(range(len(head_names)),
-                                     key=lambda i: str(head_names[i]).replace("(日)", "").strip())
-                except Exception:
-                    latest_idx = 0
-
-            # name_map: {"f2": "最新价", "f3": "涨跌幅", ...}
-            # tbl_data: {"f2": ["10.68", "11.32"], "f3": ["3.72%", "4.04%"], ...}
-            for field_key, col_name in name_map.items():
-                if field_key in ("headNameSub", "headName"):
-                    continue
-                vals = tbl_data.get(field_key)
-                if not vals or not isinstance(vals, list):
-                    continue
-                # Use latest_idx; fall back to index 0 if out of range
-                row_idx = latest_idx if latest_idx < len(vals) else 0
-                val = str(vals[row_idx])
-                if not val or val == "-":
-                    continue
-                match = re.search(r"([\d.]+)", val)
-                if not match:
-                    continue
-                num = float(match.group(1))
-                col_lower = col_name.lower()
-                if ("收盘价" in col_lower or "最新价" in col_lower or "现价" in col_lower) and price_data['price'] is None:
-                    price_data['price'] = num
-                elif "5日" in col_lower and "涨幅" in col_lower and price_data['change_5d'] is None:
-                    price_data['change_5d'] = num
-                elif "涨跌幅" in col_lower and "区间" not in col_lower and price_data['change'] is None:
-                    price_data['change'] = num
-                elif "成交量" in col_lower and price_data['volume'] is None:
-                    price_data['volume'] = int(num * 10000) if num > 1000 else int(num)
-                elif "总市值" in col_lower and price_data['market_cap'] is None:
-                    price_data['market_cap'] = val
-                elif ("市盈率" in col_lower or "pe" in col_lower) and price_data['pe'] is None:
-                    price_data['pe'] = val
-
-    except Exception:
-        # Fallback parsing is best-effort; don't crash the main flow
-        pass
+            row_idx = latest_idx if latest_idx < len(vals) else 0
+            val = str(vals[row_idx])
+            if not val or val == "-":
+                continue
+            match = re.search(r"([\d.]+)", val)
+            if not match:
+                continue
+            num = float(match.group(1))
+            col_lower = col_name.lower()
+            if ("收盘价" in col_lower or "最新价" in col_lower or "现价" in col_lower) and price_data['price'] is None:
+                price_data['price'] = num
+            elif "5日" in col_lower and "涨幅" in col_lower and price_data['change_5d'] is None:
+                price_data['change_5d'] = num
+            elif "涨跌幅" in col_lower and "区间" not in col_lower and price_data['change'] is None:
+                price_data['change'] = num
+            elif "成交量" in col_lower and price_data['volume'] is None:
+                price_data['volume'] = int(num * 10000) if num > 1000 else int(num)
+            elif "总市值" in col_lower and price_data['market_cap'] is None:
+                price_data['market_cap'] = val
+            elif ("市盈率" in col_lower or "pe" in col_lower) and price_data['pe'] is None:
+                price_data['pe'] = val
 
 
 def _fetch_rating_from_mx_search(ticker: str, market: str, result: dict) -> None:
@@ -1304,81 +1239,66 @@ def _supplement_historical_financials(query_ticker: str, forecast: dict, env: di
 
 
 def _try_parse_earnings_json(query_str: str, forecast: dict, max_age: int = 86400) -> None:
-    """Fallback: parse mx-data raw JSON for earnings forecast data.
-
-    max_age: maximum file age in seconds (default 86400 = 24h, since
-    consensus data is not time-sensitive).
-    """
-    try:
-        import glob as _glob
-        safe_query = query_str.replace(" ", "_")
-        pattern = os.path.expanduser(
-            f"~/.openclaw/workspace/mx_data/output/mx_data_{safe_query}_raw.json"
-        )
-        files = _glob.glob(pattern)
-        if not files:
-            return
-        latest = max(files, key=os.path.getmtime)
-        if os.path.getmtime(latest) < time.time() - max_age:
-            return
-        with open(latest, encoding="utf-8") as f:
-            raw = json.load(f)
-        d = _navigate_mx_data_json(raw)
-        if not isinstance(d, dict):
-            return
-        sr = d.get("searchDataResultDTO")
-        if not sr or not isinstance(sr, dict):
-            return
-        tables = sr.get("dataTableDTOList", [])
-        for tbl in tables:
-            if not isinstance(tbl, dict):
+    """Fallback: parse mx-data raw JSON for earnings forecast data."""
+    path = find_latest_raw_json(query_str, max_age=max_age)
+    if not path:
+        return
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    d = _navigate_mx_data_json(raw)
+    if not isinstance(d, dict):
+        return
+    sr = d.get("searchDataResultDTO")
+    if not sr or not isinstance(sr, dict):
+        return
+    tables = sr.get("dataTableDTOList", [])
+    for tbl in tables:
+        if not isinstance(tbl, dict):
+            continue
+        name_map = tbl.get("nameMap", {})
+        tbl_data = tbl.get("table", {})
+        if not name_map or not isinstance(tbl_data, dict):
+            continue
+        head_names = tbl_data.get("headName", [])
+        if not head_names:
+            continue
+        for row_idx, year in enumerate(head_names):
+            if year in forecast["years"]:
                 continue
-            name_map = tbl.get("nameMap", {})
-            tbl_data = tbl.get("table", {})
-            if not name_map or not isinstance(tbl_data, dict):
-                continue
-            head_names = tbl_data.get("headName", [])
-            if not head_names:
-                continue
-            for row_idx, year in enumerate(head_names):
-                if year in forecast["years"]:
-                    continue
-                rev = _strip_unit(_json_list_val(tbl_data, name_map, row_idx, ["营业总收入(元)", "营业收入"]) or "")
-                rg = _json_list_val(tbl_data, name_map, row_idx, ["营业总收入增长率(%)", "营收同比增长率"])
-                profit = _strip_unit(_json_list_val(tbl_data, name_map, row_idx, ["归母净利润(元)", "净利润"]) or "")
-                pg = _json_list_val(tbl_data, name_map, row_idx, ["归母净利润增长率(%)", "利润同比增长率"])
-                eps = _json_list_val(tbl_data, name_map, row_idx, ["EPS(稀释)", "每股收益"])
-                pe = _json_list_val(tbl_data, name_map, row_idx, ["PE"])
-                peg = _json_list_val(tbl_data, name_map, row_idx, ["PEG"])
-                roe = _json_list_val(tbl_data, name_map, row_idx, ["ROE(摊薄)(%)", "ROE(%)"])
+            rev = strip_unit(_json_list_val(tbl_data, name_map, row_idx, ["营业总收入(元)", "营业收入"]) or "")
+            rg = _json_list_val(tbl_data, name_map, row_idx, ["营业总收入增长率(%)", "营收同比增长率"])
+            profit = strip_unit(_json_list_val(tbl_data, name_map, row_idx, ["归母净利润(元)", "净利润"]) or "")
+            pg = _json_list_val(tbl_data, name_map, row_idx, ["归母净利润增长率(%)", "利润同比增长率"])
+            eps = _json_list_val(tbl_data, name_map, row_idx, ["EPS(稀释)", "每股收益"])
+            pe = _json_list_val(tbl_data, name_map, row_idx, ["PE"])
+            peg = _json_list_val(tbl_data, name_map, row_idx, ["PEG"])
+            roe = _json_list_val(tbl_data, name_map, row_idx, ["ROE(摊薄)(%)", "ROE(%)"])
 
-                rg_fmt = None
-                if rg:
-                    m = re.search(r"([\-\d.]+)", rg)
-                    if m: rg_fmt = m.group(1) + "%"
-                pg_fmt = None
-                if pg:
-                    m = re.search(r"([\-\d.]+)", pg)
-                    if m: pg_fmt = m.group(1) + "%"
+            rg_fmt = None
+            if rg:
+                m = re.search(r"([\-\d.]+)", rg)
+                if m: rg_fmt = m.group(1) + "%"
+            pg_fmt = None
+            if pg:
+                m = re.search(r"([\-\d.]+)", pg)
+                if m: pg_fmt = m.group(1) + "%"
 
-                forecast["years"].append(year)
-                forecast["revenue"].append(rev if rev and rev != "-" else "N/A")
-                forecast["revenue_growth"].append(rg_fmt or "N/A")
-                forecast["net_profit"].append(profit if profit and profit != "-" else "N/A")
-                forecast["profit_growth"].append(pg_fmt or "N/A")
-                forecast["eps"].append(eps if eps and eps != "-" else "N/A")
+            forecast["years"].append(year)
+            forecast["revenue"].append(rev if rev and rev != "-" else "N/A")
+            forecast["revenue_growth"].append(rg_fmt or "N/A")
+            forecast["net_profit"].append(profit if profit and profit != "-" else "N/A")
+            forecast["profit_growth"].append(pg_fmt or "N/A")
+            forecast["eps"].append(eps if eps and eps != "-" else "N/A")
 
-                if pe and forecast["forecast_pe_fy1"] == "N/A":
-                    forecast["forecast_pe_fy1"] = pe
-                if peg and forecast["forecast_peg_fy1"] == "N/A":
-                    forecast["forecast_peg_fy1"] = peg
-                if roe and forecast["forecast_roe_fy1"] == "N/A":
-                    forecast["forecast_roe_fy1"] = roe + "%" if "%" not in roe else roe
+            if pe and forecast["forecast_pe_fy1"] == "N/A":
+                forecast["forecast_pe_fy1"] = pe
+            if peg and forecast["forecast_peg_fy1"] == "N/A":
+                forecast["forecast_peg_fy1"] = peg
+            if roe and forecast["forecast_roe_fy1"] == "N/A":
+                forecast["forecast_roe_fy1"] = roe + "%" if "%" not in roe else roe
 
-                if len(forecast["years"]) >= 3:
-                    break
-    except Exception:
-        pass
+            if len(forecast["years"]) >= 3:
+                break
 
 
 def _json_list_val(tbl_data: dict, name_map: dict, row_idx: int, col_names: list) -> str:
