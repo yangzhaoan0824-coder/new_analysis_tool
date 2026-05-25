@@ -1410,5 +1410,374 @@ class TestModuleIntegration(unittest.TestCase):
         self.assertEqual(result["valuation"], "显著高估")
 
 
+# ── ReportGenerator generate_markdown_report tests ──────────────────────────────────
+
+def _make_r(stock_name="测试", tech=None, dashboard=None):
+    """Minimal mock analysis_result for markdown tests."""
+    r = MagicMock()
+    r.sentiment_score = 55
+    r.operation_advice = "持有"
+    r.name = stock_name
+    r._latest_tech_data = tech or {}
+    r.dashboard = dashboard or {}
+    return r
+
+
+class TestReportGeneratorMarkdown(unittest.TestCase):
+    """Test generate_markdown_report output for all report sections."""
+
+    # ── Helpers ─────────────────────────────────────────────────────────────────
+
+    def _render(self, results=None, market="hk", ticker="HK01316"):
+        """Render markdown with minimal default results (delegates to _default_results)."""
+        if results is None:
+            results = self._default_results(market=market, ticker=ticker)
+        return ReportGenerator(results).generate_markdown_report()
+
+    # ── Report structure ───────────────────────────────────────────────────────
+
+    def test_markdown_has_report_title(self):
+        """Markdown must include investment research report title."""
+        md = self._render()
+        self.assertIn("投资研究报告", md)
+
+    def test_markdown_has_disclaimer(self):
+        """Markdown must include disclaimer."""
+        md = self._render()
+        self.assertIn("免责声明", md)
+
+    def test_markdown_has_data_source_note(self):
+        """Markdown must include data source note."""
+        md = self._render()
+        self.assertIn("数据说明", md)
+
+    def test_markdown_contains_timestamp(self):
+        """Markdown must contain generation date."""
+        md = self._render()
+        # Should contain a date-like string
+        import re
+        self.assertTrue(re.search(r"202\d-", md), "No year-202x date found in markdown")
+
+    # ── Market label / currency ─────────────────────────────────────────────────
+
+    def test_markdown_hk_uses_hkd(self):
+        """HK stock report must use 港元 as currency unit."""
+        md = self._render(market="hk", ticker="HK01316")
+        self.assertIn("港元", md)
+
+    def test_markdown_a_stock_uses_rmb(self):
+        """A-stock report must use 元 as currency unit."""
+        md = self._render(market="a", ticker="600519")
+        self.assertIn("元", md)
+
+    def test_markdown_us_stock_uses_rmb(self):
+        """US-stock report must use 元 as currency unit."""
+        md = self._render(market="us", ticker="TSLA")
+        self.assertIn("元", md)
+
+    # ── RSI interpretation ─────────────────────────────────────────────────────
+
+    def test_markdown_rsi_overbought(self):
+        """RSI > 70 must display 🔴 超买."""
+        r = _make_r(tech={"col_5": 75.0})
+        results = self._default_results(market="hk", r=r)
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIn("🔴 超买", md)
+
+    def test_markdown_rsi_near_overbought(self):
+        """RSI 60-70 must display 🟡 接近超买."""
+        r = _make_r(tech={"col_5": 65.0})
+        results = self._default_results(market="hk", r=r)
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIn("🟡 接近超买", md)
+
+    def test_markdown_rsi_normal(self):
+        """RSI 0-60 must display 🟢 正常."""
+        r = _make_r(tech={"col_5": 50.0})
+        results = self._default_results(market="hk", r=r)
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIn("🟢 正常", md)
+
+    def test_markdown_rsi_na(self):
+        """Missing RSI must display N/A."""
+        r = _make_r(tech={})
+        results = self._default_results(market="hk", r=r)
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIn("N/A", md)
+
+    # ── MA comparison ─────────────────────────────────────────────────────────
+
+    def test_markdown_price_above_ma5(self):
+        """Price > MA5 must show ✅ in MA5 interpretation."""
+        r = _make_r(tech={"col_1": 5.0})  # MA5 = 5.0
+        results = self._default_results(market="hk", r=r)
+        results["current_price"] = 5.30  # > 5.0
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIn("价格 > MA5 ✅", md)
+
+    def test_markdown_price_below_ma5(self):
+        """Price < MA5 must show ⚠️ in MA5 interpretation."""
+        r = _make_r(tech={"col_1": 6.0})  # MA5 = 6.0
+        results = self._default_results(market="hk", r=r)
+        results["current_price"] = 5.30  # < 6.0
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIn("价格 < MA5 ⚠️", md)
+
+    # ── MACD display ───────────────────────────────────────────────────────────
+
+    def test_markdown_macd_full_data(self):
+        """MACD with all fields must show DIFF/DEA/柱 values."""
+        r = _make_r(tech={"col_3": 0.15, "col_4": 0.10, "macd_histogram": 0.0498})
+        results = self._default_results(market="hk", r=r)
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIn("DIFF=", md)
+        self.assertIn("DEA=", md)
+        self.assertIn("柱=", md)
+
+    def test_markdown_macd_missing_histogram(self):
+        """MACD without histogram must show N/A for 柱."""
+        r = _make_r(tech={"col_3": 0.15, "col_4": 0.10})
+        results = self._default_results(market="hk", r=r)
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIn("柱=N/A", md)
+
+    def test_markdown_macd_no_data(self):
+        """Missing MACD must show N/A."""
+        r = _make_r(tech={})
+        results = self._default_results(market="hk", r=r)
+        md = ReportGenerator(results).generate_markdown_report()
+        # Should fall back to r._latest_tech_data empty dict
+        self.assertIn("N/A", md)
+
+    # ── Peer comparison table ──────────────────────────────────────────────────
+
+    def test_markdown_peers_empty(self):
+        """Empty peers list must not crash markdown generation."""
+        r = _make_r()
+        results = self._default_results(market="hk", r=r)
+        results["composite"]["peers"] = []
+        md = ReportGenerator(results).generate_markdown_report()
+        # Should still produce valid markdown
+        self.assertIn("投资研究报告", md)
+
+    def test_markdown_peers_populated(self):
+        """Populated peers must appear in markdown."""
+        r = _make_r()
+        results = self._default_results(market="hk", r=r)
+        results["composite"]["peers"] = [
+            {"name": "行业平均", "pe": "15-20", "peg": "1.0-1.3", "note": "港股参考"},
+            {"name": "HK01316", "pe": "16.76", "peg": "计算中", "note": "当前标的"},
+        ]
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIn("行业平均", md)
+        self.assertIn("HK01316", md)
+
+    # ── GS metrics / financial indicators ─────────────────────────────────────
+
+    def test_markdown_gs_metrics_na(self):
+        """N/A GS metrics must not crash."""
+        r = _make_r()
+        results = self._default_results(market="hk", r=r)
+        results["composite"]["gs_metrics"] = {
+            "roe": "N/A", "fcf": "N/A", "fcf_note": "",
+            "debt_ratio": "N/A", "net_debt_ebitda": "N/A",
+            "beta": "N/A", "forecast_pe_fy1": "N/A",
+            "forecast_peg_fy1": "N/A",
+        }
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIsInstance(md, str)
+        self.assertGreater(len(md), 100)
+
+    def test_markdown_gs_metrics_populated(self):
+        """Populated GS metrics must appear in markdown."""
+        r = _make_r()
+        results = self._default_results(market="hk", r=r)
+        results["composite"]["gs_metrics"] = {
+            "roe": "4.83%", "fcf": "N/A", "fcf_note": "",
+            "debt_ratio": "42.7%", "net_debt_ebitda": "1.3x",
+            "beta": "1.20", "forecast_pe_fy1": "11.84",
+            "forecast_peg_fy1": "0.33",
+        }
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIn("4.83%", md)
+        self.assertIn("42.7%", md)
+
+    # ── Confidence / rating ────────────────────────────────────────────────────
+
+    def test_markdown_confidence_80_above(self):
+        """Confidence >= 80 must show ✅ icon."""
+        r = _make_r()
+        results = self._default_results(market="hk", r=r)
+        results["composite"]["confidence"] = 85
+        results["composite"]["confidence_detail"] = "完整数据✅"
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIn("✅", md)
+
+    def test_markdown_confidence_60_79(self):
+        """Confidence 60-79 must show 🟡 icon."""
+        r = _make_r()
+        results = self._default_results(market="hk", r=r)
+        results["composite"]["confidence"] = 65
+        results["composite"]["confidence_detail"] = "部分数据"
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIn("🟡", md)
+
+    def test_markdown_confidence_below_60(self):
+        """Confidence < 60 must show ⚠️ icon."""
+        r = _make_r()
+        results = self._default_results(market="hk", r=r)
+        results["composite"]["confidence"] = 40
+        results["composite"]["confidence_detail"] = "数据不足"
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIn("⚠️", md)
+
+    # ── Catalyst / risk sections ─────────────────────────────────────────────
+
+    def test_markdown_catalysts_empty(self):
+        """Empty catalysts list must not crash."""
+        r = _make_r()
+        results = self._default_results(market="hk", r=r)
+        results["composite"]["catalysts_list"] = []
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIsInstance(md, str)
+
+    def test_markdown_catalysts_populated(self):
+        """Populated catalysts must appear in markdown."""
+        r = _make_r()
+        results = self._default_results(market="hk", r=r)
+        results["composite"]["catalysts_list"] = ["业绩超预期", "回购计划"]
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIn("业绩超预期", md)
+
+    def test_markdown_no_catalysts_indicator(self):
+        """No catalysts section must show 暂无明确催化剂."""
+        r = _make_r()
+        results = self._default_results(market="hk", r=r)
+        results["composite"]["catalysts_list"] = ["暂无明确催化剂"]
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIn("暂无明确催化剂", md)
+
+    # ── Dashboard sniper points ────────────────────────────────────────────────
+
+    def test_markdown_sniper_points(self):
+        """Dashboard sniper_points data must appear in markdown.
+
+        Note: sniper_points from dashboard are read into the 'sp' variable but
+        the current template uses composite buy/sl/tp values instead.
+        The test verifies the markdown renders without error.
+        """
+        r = _make_r(dashboard={
+            "battle_plan": {
+                "sniper_points": {
+                    "ideal_buy": "5.10",
+                    "stop_loss": "4.95",
+                    "take_profit": "5.80"
+                }
+            }
+        })
+        results = self._default_results(market="hk", r=r)
+        # Markdown uses composite buy/sl, not dashboard sniper_points directly
+        # Verify it renders without KeyError
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIn("买点", md)
+        self.assertIn("止损", md)
+
+    def test_markdown_sniper_points_missing(self):
+        """Missing sniper points must not crash."""
+        r = _make_r(dashboard={})
+        results = self._default_results(market="hk", r=r)
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIsInstance(md, str)
+
+    # ── Investment thesis ─────────────────────────────────────────────────────
+
+    def test_markdown_investment_thesis(self):
+        """Populated investment thesis must appear in markdown."""
+        r = _make_r()
+        results = self._default_results(market="hk", r=r)
+        results["composite"]["investment_thesis"] = "PEG (0.33) 显示估值具备吸引力"
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIn("PEG (0.33)", md)
+
+    # ── Operation advice ──────────────────────────────────────────────────────
+
+    def test_markdown_operation_advice_section(self):
+        """Operation advice section must be present."""
+        md = self._render()
+        self.assertIn("操作建议", md)
+
+    # ── Weekly conclusion ──────────────────────────────────────────────────────
+
+    def test_markdown_weekly_conclusion(self):
+        """Weekly conclusion must appear in markdown."""
+        r = _make_r()
+        results = self._default_results(market="hk", r=r)
+        results["composite"]["weekly_conclusion"] = "✅ 日线买入 + 周线多头，信号可信"
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIn("周线多头", md)
+
+    # ── ST stock marker ───────────────────────────────────────────────────────
+
+    def test_markdown_st_stock_ticker(self):
+        """*ST stock must show ST marker in report title."""
+        r = _make_r(stock_name="ST星光")
+        results = self._default_results(market="a", ticker="002076", r=r)
+        results["analysis_result"].name = "ST星光"
+        md = ReportGenerator(results).generate_markdown_report()
+        self.assertIn("ST星光", md)
+
+    # ── Reusable default results builder ───────────────────────────────────────
+
+    @staticmethod
+    def _default_results(market="hk", ticker="HK01316", r=None):
+        if r is None:
+            r = _make_r()
+        # Provide realistic inputs so calc_fundamental_scores generates _detail / _status
+        fundamental_scores = calc_fundamental_scores(
+            earnings_forecast={"revenue": ["100"], "profit_growth": ["+10%"]},
+            gs_metrics={"roe": "10%", "debt_ratio": "50%", "fcf": "N/A",
+                        "fcf_note": "", "net_debt_ebitda": "N/A", "beta": "1.0"},
+            mx_fin={"roe": 10, "debt_ratio": 50},
+            company_profile={"industry_position": "行业公司"},
+            news_text="",
+            analyst_target="",
+            catalysts_list=[],
+        )
+        return {
+            "ticker": ticker, "market": market,
+            "market_label": {"hk": "港股", "a": "A 股", "us": "美股"}[market],
+            "analysis_result": r, "ta_decision": None,
+            "weekly_text": "周线多头趋势", "news_text": "利好",
+            "analyst_target": "", "macro_score": None,
+            "company_profile": {}, "earnings_forecast": {},
+            "current_price": 5.30, "mx_financial_data": {},
+            "price_change": "+0%", "market_cap": "N/A",
+            "consensus_rating": "N/A", "tech_indicators": {},
+            "hk_price_data": None,
+            "composite": {
+                "buy": "5.19", "sl": "5.03", "tp": "N/A",
+                "rr": None, "rr_str": "N/A",
+                "target_price_num": None, "upside": "N/A",
+                "rating": "持有", "rating_icon": "🔵",
+                "peg_result": {"peg": None, "peg_str": "N/A"},
+                "weekly_conclusion": "周线多头趋势",
+                "gs_metrics": {"roe": "N/A", "fcf": "N/A", "fcf_note": "",
+                               "debt_ratio": "N/A", "net_debt_ebitda": "N/A",
+                               "beta": "N/A", "forecast_pe_fy1": "N/A",
+                               "forecast_peg_fy1": "N/A"},
+                "revenue_comp": {"domestic": "N/A", "overseas": "N/A"},
+                "peers": [], "catalysts_list": [],
+                "investment_thesis": "无",
+                "confidence": 20, "confidence_detail": "无数据",
+                "fundamental_scores": fundamental_scores,
+                "precision_factor": "1.000000", "composite_score": "55.00",
+                "pe_ttm": "N/A",
+            },
+            "elapsed_seconds": 1.0,
+        }
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
