@@ -108,7 +108,8 @@ def mx_data_cached(ticker: str, query: str, ttl: int,
     Returns:
         subprocess.CompletedProcess with stdout populated
     """
-    from dual_engine.constants import MX_DATA_SCRIPT
+    from dual_engine.config import get_config
+    _mx_script = get_config().mx_data_script
 
     # Check cache first
     if ttl > 0:
@@ -116,7 +117,7 @@ def mx_data_cached(ticker: str, query: str, ttl: int,
         if cached is not None:
             # Return a fake CompletedProcess with cached data
             result = subprocess.CompletedProcess(
-                args=["python3.12", MX_DATA_SCRIPT, query],
+                args=["python3.12", _mx_script, query],
                 returncode=0,
                 stdout=cached,
                 stderr=""
@@ -127,7 +128,7 @@ def mx_data_cached(ticker: str, query: str, ttl: int,
     if env is None:
         env = dict(os.environ)
     result = subprocess.run(
-        ["python3.12", MX_DATA_SCRIPT, query],
+        ["python3.12", _mx_script, query],
         capture_output=True, text=True, timeout=timeout, env=env
     )
 

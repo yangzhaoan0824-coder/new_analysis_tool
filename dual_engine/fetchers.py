@@ -16,10 +16,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 from dual_engine.constants import (
     TIMEOUT_NEWS, TIMEOUT_DATA, TIMEOUT_ANALYSIS, TIMEOUT_FINANCIAL,
-    DAILY_ANALYSIS_DIR, TRADING_AGENTS_SCRIPT, MX_DATA_SCRIPT,
-    MX_SEARCH_SCRIPT, INVESTMENT_DB_SCRIPT,
-    NOTION_SYNC_DIR, NOTION_INVEST_PAGE_ID,
+    NOTION_INVEST_PAGE_ID,
 )
+from dual_engine.config import get_config
+
+_cfg = get_config()
 from dual_engine.utils import log_error, detect_market, _load_zshrc_env
 from dual_engine.data_parser import DataParser
 from dual_engine.cache import mx_data_cached, TTL_CONSENSUS, TTL_PROFILE, TTL_EARNINGS, TTL_WEEKLY, TTL_GS_METRICS
@@ -84,7 +85,7 @@ def fetch_analyst_consensus(ticker: str, market: str) -> dict:
     # A/HK/fallback: single mx-data query for both target price and rating
     query_ticker = DataParser.to_query_ticker(ticker, market)
     env = dict(os.environ)
-    env_file = os.path.join(DAILY_ANALYSIS_DIR, ".env")
+    env_file = os.path.join(_cfg.daily_analysis_dir, ".env")
     try:
         with open(env_file) as f:
             for line in f:
@@ -201,8 +202,14 @@ def fetch_analyst_rating(ticker: str, market: str) -> dict:
 
 
 def _try_parse_rating_json(query_str: str, result: dict) -> None:
-    """Fallback: parse mx-data raw JSON for analyst rating."""
-    path = find_latest_raw_json(query_str, max_age=120)
+    """Fallback: parse mx-data raw JSON for analyst rating.
+
+    mx-data 返回的 JSON 结构（目标价/评级表）：
+        headName (list)         = ['综合评级', '评级买入家数', '评级增持家数', ...]
+        nameMap  (dict)         = {'1月内': row_data, '2月内': row_data, ...}
+        row_data (list)         = ['买入', 1, 0, 0, 0, 0, ...]  (按 headName 顺序对齐)
+    """
+    path = find_latest_raw_json(query_str, max_age=86400)
     if not path:
         return
     with open(path, encoding="utf-8") as f:
@@ -214,6 +221,7 @@ def _try_parse_rating_json(query_str: str, result: dict) -> None:
     if not sr or not isinstance(sr, dict):
         return
     tables = sr.get("dataTableDTOList", [])
+
     for tbl in tables:
         if not isinstance(tbl, dict):
             continue
@@ -221,25 +229,38 @@ def _try_parse_rating_json(query_str: str, result: dict) -> None:
         tbl_data = tbl.get("table", {})
         if not name_map or not isinstance(tbl_data, dict):
             continue
-        for field_key, col_name in name_map.items():
-            if field_key in ("headNameSub",) or not col_name:
+        head_names = tbl_data.get("headName") or tbl_data.get("headNameSub") or []
+        if not head_names:
+            continue
+
+        # 遍历每一行（name_map 中除 headNameSub 之外的都是行名）
+        for row_key, row_vals in name_map.items():
+            if row_key in ("headNameSub", "headName"):
                 continue
-            vals = tbl_data.get(field_key, [])
-            if not isinstance(vals, list):
+            if not isinstance(row_vals, list) or len(row_vals) == 0:
                 continue
-            val = None
-            for v in reversed(vals):
-                if v and str(v).strip() and str(v).strip() != "-":
-                    val = str(v).strip()
-                    break
-            if not val:
-                continue
-            if "综合评级" in col_name and not result["rating"]:
-                result["rating"] = val
-            elif "机构总家数" in col_name and not result["count"]:
-                m = re.search(r"(\d+)", val)
-                if m:
-                    result["count"] = int(m.group(1))
+
+            # 寻找这一行里的"综合评级"和"评级机构总家数"列
+            for col_idx, hn in enumerate(head_names):
+                if not isinstance(hn, str):
+                    continue
+                if col_idx >= len(row_vals):
+                    continue
+                val = row_vals[col_idx]
+                if val is None or str(val).strip() in ("", "-"):
+                    continue
+
+                if "综合评级" in hn and not result["rating"]:
+                    result["rating"] = str(val).strip()
+                elif "评级机构总家数" in hn:
+                    m = re.search(r"(\d+)", str(val))
+                    if m:
+                        result["count"] = int(m.group(1))
+                        break  # 取到这一行的家数即可
+
+            # 如果已经拿到 rating 和 count（任一），且 row_key 是 "1月内"，就停止
+            if row_key == "1月内" and (result["rating"] or result["count"]):
+                break
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -251,7 +272,7 @@ def fetch_news_via_mx_search(ticker: str, name: str = "") -> str:
     query = f"{name or ticker} 最新公告 新闻 研报" if name else f"{ticker} 最新公告 新闻"
     try:
         result = subprocess.run(
-            ["python3.12", MX_SEARCH_SCRIPT, query],
+            ["python3.12", _cfg.mx_search_script, query],
             capture_output=True, text=True, timeout=TIMEOUT_NEWS,
             env={**os.environ}
         )
@@ -366,7 +387,7 @@ def run_daily_analysis(ticker: str):
             query_str = f"{query_ticker} MA5 MA20 MACD RSI 技术指标 近 30 日"
             print(f"   📊 使用 mx-data 获取港股技术指标...")
             mx_result = subprocess.run(
-                ["python3.12", MX_DATA_SCRIPT, query_str],
+                ["python3.12", _cfg.mx_data_script, query_str],
                 capture_output=True, text=True, timeout=TIMEOUT_DATA
             )
             # Step 1: stdout 解析，取最新日期那行（优先，保证最新数据）
@@ -440,7 +461,7 @@ def run_daily_analysis(ticker: str):
             query_ticker = ticker + (".SS" if ticker.startswith(("6", "5")) else ".SZ")
             query_str = f"{query_ticker} MA5 MA20 MACD RSI 技术指标 近 30 日"
             mx_result = subprocess.run(
-                ["python3.12", MX_DATA_SCRIPT, query_str],
+                ["python3.12", _cfg.mx_data_script, query_str],
                 capture_output=True, text=True, timeout=TIMEOUT_DATA
             )
             # Step 1: stdout 解析，取最新日期那行（优先）
@@ -512,9 +533,12 @@ def run_daily_analysis(ticker: str):
             print(f"   ⚠️ 美股技术分析异常：{e}")
 
     # Run daily_stock_analysis
-    sys.path.insert(0, DAILY_ANALYSIS_DIR)
+    # Insert at position 1 (not 0) so the project root stays on sys.path[0]
+    # This allows both 'src.*' and 'analyzer_service' imports to work
+    _orig_sys_path = list(sys.path)
     _orig_cwd = os.getcwd()
-    os.chdir(DAILY_ANALYSIS_DIR)
+    sys.path.insert(1, str(_cfg.daily_analysis_dir))
+    os.chdir(_cfg.daily_analysis_dir)
 
     from dotenv import load_dotenv
     load_dotenv(override=True)
@@ -593,8 +617,9 @@ def run_daily_analysis(ticker: str):
     if latest_tech_data:
         result._latest_tech_data = latest_tech_data
 
-    # Restore original working directory
+    # Restore original working directory and sys.path
     os.chdir(_orig_cwd)
+    sys.path[:] = _orig_sys_path
 
     return result
 
@@ -607,7 +632,7 @@ def run_trading_agents(ticker: str) -> str:
     """Run trading-agents for US stocks, return BUY/SELL/HOLD/N/A."""
     date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     result = subprocess.run(
-        ["python3.12", TRADING_AGENTS_SCRIPT, ticker, date, "--fast"],
+        ["python3.12", _cfg.trading_agents_dir / "analyze.py", ticker, date, "--fast"],
         capture_output=True, text=True
     )
     for line in result.stdout.splitlines():
@@ -652,7 +677,7 @@ def _calc_5day_change(query_ticker: str) -> Optional[float]:
     """
     try:
         r = subprocess.run(
-            ["python3.12", MX_DATA_SCRIPT, f"{query_ticker} 区间涨跌幅"],
+            ["python3.12", _cfg.mx_data_script, f"{query_ticker} 区间涨跌幅"],
             capture_output=True, text=True, timeout=TIMEOUT_DATA,
             env={**os.environ, "MX_APIKEY": os.environ.get("MX_APIKEY", "")}
         )
@@ -715,7 +740,11 @@ def _calc_5day_change(query_ticker: str) -> Optional[float]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _try_parse_mx_json(query_str: str, price_data: dict) -> None:
-    """Fallback: parse mx-data raw JSON file when stdout parsing misses price."""
+    """Fallback: parse mx-data raw JSON file when stdout parsing misses price.
+
+    mx-data returns multiple tables (e.g. 最新价 table + 5日涨跌幅 table).
+    Parse ALL tables to fill price_data fields, not just the first one.
+    """
     path = find_latest_raw_json(query_str, max_age=120)
     if not path:
         return
@@ -761,14 +790,17 @@ def _try_parse_mx_json(query_str: str, price_data: dict) -> None:
             val = str(vals[row_idx])
             if not val or val == "-":
                 continue
-            match = re.search(r"([\d.]+)", val)
+            match = re.search(r"([\d.\-]+)", val)
             if not match:
                 continue
-            num = float(match.group(1))
+            try:
+                num = float(match.group(1))
+            except ValueError:
+                continue
             col_lower = col_name.lower()
             if ("收盘价" in col_lower or "最新价" in col_lower or "现价" in col_lower) and price_data['price'] is None:
                 price_data['price'] = num
-            elif "5日" in col_lower and "涨幅" in col_lower and price_data['change_5d'] is None:
+            elif ("5日" in col_lower or "5日涨幅" in col_lower) and price_data['change_5d'] is None:
                 price_data['change_5d'] = num
             elif "涨跌幅" in col_lower and "区间" not in col_lower and price_data['change'] is None:
                 price_data['change'] = num
@@ -789,7 +821,7 @@ def _fetch_rating_from_mx_search(ticker: str, market: str, result: dict) -> None
     try:
         query = f"{ticker} 机构评级 目标价 研报"
         r = subprocess.run(
-            ["python3.12", MX_SEARCH_SCRIPT, query],
+            ["python3.12", _cfg.mx_search_script, query],
             capture_output=True, text=True, timeout=TIMEOUT_NEWS,
             env={**os.environ}
         )
@@ -830,7 +862,7 @@ def _fetch_price_from_mx(query_ticker: str, market: str) -> Optional[dict]:
     try:
         query_str = f"{query_ticker} 最新价 涨跌幅 5日涨幅 总市值 市盈率"
         result = subprocess.run(
-            ["python3.12", MX_DATA_SCRIPT, query_str],
+            ["python3.12", _cfg.mx_data_script, query_str],
             capture_output=True, text=True, timeout=TIMEOUT_DATA,
             env={**os.environ, "MX_APIKEY": os.environ.get("MX_APIKEY", "")}
         )
@@ -847,9 +879,12 @@ def _fetch_price_from_mx(query_ticker: str, market: str) -> Optional[dict]:
                         if i < len(parts):
                             val = parts[i]
                             if val and val != "-":
-                                match = re.search(r"([\d.]+)", val)
+                                match = re.search(r"([\d.\-]+)", val)
                                 if match:
-                                    num = float(match.group(1))
+                                    try:
+                                        num = float(match.group(1))
+                                    except ValueError:
+                                        continue
                                     if ("收盘价" in col or "最新价" in col or "现价" in col) and price_data['price'] is None:
                                         price_data['price'] = num
                                     elif "5日" in col and "涨幅" in col and price_data['change_5d'] is None:
@@ -863,9 +898,17 @@ def _fetch_price_from_mx(query_ticker: str, market: str) -> Optional[dict]:
                                     elif ("市盈率" in col or "PE" in col.upper()) and price_data['pe'] is None:
                                         price_data['pe'] = val
 
-        # Fallback: read raw JSON file if price not found in stdout
-        if price_data['price'] is None:
-            _try_parse_mx_json(query_str, price_data)
+        # Fallback: read raw JSON file if price not found in stdout, OR if 5-day change is missing.
+        # 修复：mx-data 有时 raw JSON 在 stdout 输出后 1-2 秒才完整写入，
+        # 导致首次解析拿到 change_5d=None。最多重试 3 次，每次 sleep 0.6s。
+        if price_data['price'] is None or price_data['change_5d'] is None:
+            import sys, time as _t
+            for _attempt in range(3):
+                if _attempt > 0:
+                    _t.sleep(0.6)
+                _try_parse_mx_json(query_str, price_data)
+                if price_data['price'] is not None and price_data['change_5d'] is not None:
+                    break
 
         # If 5-day change still not available, compute from 区间涨跌幅
         if price_data['change_5d'] is None and price_data['price'] is not None:
@@ -940,23 +983,22 @@ def fetch_company_profile(ticker: str, market: str, price_data: dict = None) -> 
         queries = [
             f"{query_ticker} 公司简介",
             f"{query_ticker} 所属行业板块",
+            f"{query_ticker} 营收构成 主营业务 国内 海外",
         ]
         # Only query market_cap/PE if not already provided by price_data
         need_valuation = not (price_data and price_data.get('market_cap') and price_data.get('pe'))
         if need_valuation:
             queries.append(f"{query_ticker} 总市值 市盈率 TTM 市净率")
-        queries.append(f"{query_ticker} 主营构成 收入构成 国内 海外")
         with ThreadPoolExecutor(max_workers=4) as executor:
             stdout_results = list(executor.map(_run_query, queries))
 
         # Query 1: company intro
         stdout1 = stdout_results[0]
         if stdout1:
-            biz_match = re.search(r"【公司简介】(.*?)(?:【|$)", stdout1)
-            if biz_match:
-                profile["business"] = biz_match.group(1).strip()[:80]
+            # Try JSON fallback first (stdout often only shows first 20 rows)
+            _try_parse_company_intro_json(f"{query_ticker} 公司简介", profile)
 
-        # Query 2: industry sector
+        # Query 2: industry sector (returns 行业/产品/地区 营收构成)
         stdout2 = stdout_results[1]
         if stdout2:
             sector = None
@@ -965,13 +1007,31 @@ def fetch_company_profile(ticker: str, market: str, price_data: dict = None) -> 
                 if m:
                     sector = m.group(1).strip()
                     break
+
+            # Parse 营收构成 JSON for "行业" row (锂行业/民爆 etc.) and product breakdown
+            _try_parse_revenue_breakdown_json(f"{query_ticker} 营收构成 主营业务 国内 海外", profile)
+
+            # Fallback sector detection: from business description keywords
+            biz_desc = profile.get("business", "")
+            if not profile.get("industry_sector"):
+                for kw in ["锂", "锂盐", "氢氧化锂", "碳酸锂"]:
+                    if kw in biz_desc:
+                        profile["industry_sector"] = "锂行业"
+                        break
+                if not profile.get("industry_sector"):
+                    for kw in ["民爆", "爆破"]:
+                        if kw in biz_desc:
+                            profile["industry_sector"] = "民爆行业"
+                            break
+
+            sector = profile.get("industry_sector") or sector
             desc = profile.get("business", "")
             if "全球领先" in desc or "全球" in desc:
                 profile["industry_position"] = f"全球{sector if sector else '行业'}领先企业"
             elif "中国领先" in desc or "国内领先" in desc:
                 profile["industry_position"] = f"国内{sector if sector else '行业'}领先企业"
             elif sector:
-                profile["industry_position"] = f"{sector}行业"
+                profile["industry_position"] = f"{sector}（行业地位待细化）"
             else:
                 profile["industry_position"] = "行业地位待更新"
 
@@ -1021,6 +1081,135 @@ def fetch_company_profile(ticker: str, market: str, price_data: dict = None) -> 
     except Exception as e:
         log_error("company_profile", str(e))
     return profile
+
+
+def _try_parse_company_intro_json(query_str: str, profile: dict) -> None:
+    """Parse mx-data 公司简介 JSON for company description.
+
+    JSON 结构：
+        nameMap: {'company_base_info': '公司基本信息', ...}
+        table.company_base_info: ['【股票代码】...【公司简介】...【主营产品】...']
+    """
+    path = find_latest_raw_json(query_str, max_age=86400)
+    if not path:
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+        d = _navigate_mx_data_json(raw)
+        if not isinstance(d, dict):
+            return
+        sr = d.get("searchDataResultDTO")
+        if not sr or not isinstance(sr, dict):
+            return
+        for tbl in sr.get("dataTableDTOList", []):
+            if not isinstance(tbl, dict):
+                continue
+            tbl_data = tbl.get("table", {})
+            # Find the long description field (any field with 80+ chars)
+            for fk, vals in tbl_data.items():
+                if fk == "headName" or not isinstance(vals, list) or not vals:
+                    continue
+                v0 = str(vals[0]) if vals else ""
+                if "【公司简介】" not in v0:
+                    continue
+                # Extract 【公司简介】... (up to next 【 marker or end)
+                m = re.search(r"【公司简介】(.*?)(?:【主营产品】|【|$)", v0)
+                if m:
+                    desc = m.group(1).strip()
+                    if desc and len(desc) > 20:
+                        profile["business"] = desc[:120]
+                # Extract product line for industry classification
+                if "锂" in v0:
+                    profile["industry_sector"] = "锂行业"
+                elif "民爆" in v0:
+                    profile["industry_sector"] = "民爆行业"
+                # Extract 第一大股东 / 持股比例
+                m2 = re.search(r"【公司第一大股东持股比例】([\d.]+%)", v0)
+                if m2:
+                    profile["top_shareholder_ratio"] = m2.group(1)
+                return
+    except Exception:
+        pass
+
+
+def _try_parse_revenue_breakdown_json(query_str: str, profile: dict) -> None:
+    """Parse mx-data 营收构成 JSON for product breakdown and industry tags.
+
+    JSON 结构：
+        headName: ['主营构成', '主营业务收入(元)', '主营业务收入占比', ...]
+        table.<row_key>: [行业名, 收入, 占比, 成本, 成本占比, ...]
+
+    row_key 0=N corresponds to nameMap 键 '0'='行业'/'产品'/'地区' (取决于分类)
+    实际 mx-data 行为：nameMap 的 key 是 0/1/2/...，value 是分类（行业/产品/地区）
+    """
+    path = find_latest_raw_json(query_str, max_age=86400)
+    if not path:
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+        d = _navigate_mx_data_json(raw)
+        if not isinstance(d, dict):
+            return
+        sr = d.get("searchDataResultDTO")
+        if not sr or not isinstance(sr, dict):
+            return
+        for tbl in sr.get("dataTableDTOList", []):
+            if not isinstance(tbl, dict):
+                continue
+            name_map = tbl.get("nameMap", {})
+            tbl_data = tbl.get("table", {})
+            if not name_map or not isinstance(tbl_data, dict):
+                continue
+
+            by_product = []
+            domestic_pct = None
+            overseas_pct = None
+            industry_top = None
+            current_cat = ""  # 携带上一次的非空分类（mx-data 把同行延续的 category 标为空字符串）
+
+            for row_key, category_label in name_map.items():
+                if row_key in ("headNameSub", "headName"):
+                    continue
+                row_vals = tbl_data.get(row_key)
+                if not isinstance(row_vals, list) or len(row_vals) < 3:
+                    continue
+                item_name = str(row_vals[0]).strip()
+                revenue = str(row_vals[1]).strip() if len(row_vals) > 1 else "N/A"
+                pct_raw = str(row_vals[2]).strip() if len(row_vals) > 2 else "N/A"
+                # 占比可能是 "56.46%" 或 "-"
+                pct = pct_raw if "%" in pct_raw else (pct_raw + "%" if pct_raw not in ("-", "N/A", "") else "N/A")
+
+                # category_label 可能是 "行业"/"产品"/"地区"，也可能是空（mx-data 对延续行标空字符串）
+                cat = str(category_label).strip() if category_label else ""
+                if cat:
+                    current_cat = cat
+                # 使用 current_cat（含延续行），忽略 "销售模式"
+                effective_cat = current_cat if cat in ("", "行业", "产品", "地区") else cat
+
+                if effective_cat == "产品":
+                    by_product.append({"name": item_name, "revenue": revenue, "percent": pct})
+                elif effective_cat == "地区":
+                    if "中国" in item_name or "大陆" in item_name or "境内" in item_name:
+                        domestic_pct = pct
+                    elif "国外" in item_name or "海外" in item_name or "境外" in item_name:
+                        overseas_pct = pct
+                elif effective_cat == "行业" and industry_top is None:
+                    industry_top = item_name
+
+            if industry_top and not profile.get("industry_sector"):
+                profile["industry_sector"] = industry_top
+
+            if by_product:
+                profile["revenue_by_product"] = by_product
+            if domestic_pct or overseas_pct:
+                profile["revenue_split"] = (
+                    f"国内 {domestic_pct or 'N/A'} | 海外 {overseas_pct or 'N/A'}"
+                )
+            return
+    except Exception:
+        pass
 
 
 def fetch_earnings_forecast(ticker: str, market: str) -> dict:
@@ -1093,13 +1282,16 @@ def fetch_earnings_forecast(ticker: str, market: str) -> dict:
                     peg_val = row_dict.get("PEG")
                     roe_val = row_dict.get("ROE(摊薄)(%)") or row_dict.get("ROE(%)")
 
-                    # Only fill forecast_ fields from the latest (most recent) row
-                    if pe_val and pe_val != "-" and forecast["forecast_pe_fy1"] == "N/A":
-                        forecast["forecast_pe_fy1"] = pe_val
-                    if peg_val and peg_val != "-" and forecast["forecast_peg_fy1"] == "N/A":
-                        forecast["forecast_peg_fy1"] = peg_val
-                    if roe_val and roe_val != "-" and forecast["forecast_roe_fy1"] == "N/A":
-                        forecast["forecast_roe_fy1"] = roe_val + "%" if "%" not in roe_val else roe_val
+                    # Only fill forecast_ fields from rows ending in 'E' (预测年) — skip historical 'A' rows
+                    is_forecast_year = year.endswith('E')
+                    if is_forecast_year:
+                        if pe_val and pe_val != "-" and forecast["forecast_pe_fy1"] == "N/A":
+                            forecast["forecast_pe_fy1"] = pe_val
+                        # 优先用一致预期表的 PEG（更准确，按年映射）
+                        if peg_val and peg_val != "-" and forecast["forecast_peg_fy1"] == "N/A":
+                            forecast["forecast_peg_fy1"] = peg_val
+                        if roe_val and roe_val != "-" and forecast["forecast_roe_fy1"] == "N/A":
+                            forecast["forecast_roe_fy1"] = roe_val + "%" if "%" not in roe_val else roe_val
 
                     forecast["years"].append(year)
                     forecast["revenue"].append(revenue_val or "N/A")
@@ -1107,12 +1299,16 @@ def fetch_earnings_forecast(ticker: str, market: str) -> dict:
                     forecast["net_profit"].append(profit_val or "N/A")
                     forecast["profit_growth"].append(profit_growth_val or "N/A")
                     forecast["eps"].append(eps_val or "N/A")
-                    if len(forecast["years"]) >= 3:
+                    # 取到至少 1 个预测年（E 结尾）且累计 ≥ 3 行；否则继续
+                    has_forecast = any('E' in y for y in forecast["years"])
+                    if len(forecast["years"]) >= 6:
+                        break
+                    if has_forecast and len(forecast["years"]) >= 3:
                         break
 
         # Always try JSON fallback to supplement any missing data
-        if not forecast["years"]:
-            _try_parse_earnings_json(query_str, forecast)
+        # 修复：即使已有历史年，仍调用 JSON 来补全预测年数据
+        _try_parse_earnings_json(query_str, forecast)
 
         # ── Supplement: if revenue/profit/EPS still N/A, query historical financials ──
         has_nas = any(v == "N/A" for v in forecast.get("revenue", [])[:1]) \
@@ -1316,19 +1512,25 @@ def _json_list_val(tbl_data: dict, name_map: dict, row_idx: int, col_names: list
     return None
 
 
-def fetch_peer_comparison(ticker: str, market: str, pe_ttm: str) -> list:
-    """Fetch peer comparison data from mx-data and industry benchmarks."""
+def fetch_peer_comparison(ticker: str, market: str, pe_ttm: str, industry_label: str = "") -> list:
+    """Fetch peer comparison data from mx-data and industry benchmarks.
+
+    Args:
+        industry_label: Optional industry name (e.g. '锂行业'). When provided,
+                        use it instead of the hard-coded "汽车零部件" benchmark.
+    """
     peers = []
     industry_median = "N/A"
     industry_min = "N/A"
     industry_max = "N/A"
-    
+    benchmark_label = industry_label if industry_label else "汽车零部件"
+
     try:
         query_ticker = DataParser.to_query_ticker(ticker, market)
         
         # 1. Query industry benchmark (PE median)
         try:
-            r = mx_data_cached(query_ticker, f"汽车零部件 市盈率PE中位数", TTL_CONSENSUS, env=None, timeout=TIMEOUT_DATA)
+            r = mx_data_cached(query_ticker, f"{benchmark_label} 市盈率PE中位数", TTL_CONSENSUS, env=None, timeout=TIMEOUT_DATA)
             stdout = r.stdout if r else ""
             if stdout:
                 for line in stdout.splitlines():
@@ -1472,7 +1674,7 @@ def fetch_peer_comparison(ticker: str, market: str, pe_ttm: str) -> list:
     note = "汽车零部件（参考基准）" if industry_median != "N/A" else "行业中位数待查询"
     result.append({
         "name": "行业中位数", "code": "-", "pe": median_str,
-        "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "note": note
+        "peg": "—", "roe": "—", "mcap": "—", "growth": "—", "note": f"{benchmark_label}（参考基准）"
     })
 
     # Add min/max PE peers
@@ -1526,7 +1728,7 @@ def fetch_catalysts(ticker: str, market: str) -> list:
             """Search one group, return (label, stdout)."""
             label, query = group
             try:
-                r = subprocess.run(["python3.12", MX_SEARCH_SCRIPT, query],
+                r = subprocess.run(["python3.12", _cfg.mx_search_script, query],
                                    capture_output=True, text=True, timeout=TIMEOUT_NEWS)
                 return (label, r.stdout)
             except Exception:
@@ -1670,6 +1872,20 @@ def fetch_gs_financial_metrics(ticker: str, market: str, price_data: dict = None
                                 if "预测PEG" in col and year == "2026" and metrics["forecast_peg_fy1"] == "N/A":
                                     metrics["forecast_peg_fy1"] = val
 
+        # 历史 PEG 值：mx-data 第二张表通常按日期序列给历史 PEG（如 0.2331）。
+        # 这里取最新一日的历史 PEG 作为 PEG(FY1) 的参考（仅当 forecast_peg_fy1 仍为 N/A）
+        if metrics["forecast_peg_fy1"] == "N/A" and len(stdout_results) > 2:
+            stdout3 = stdout_results[2]
+            for line in stdout3.splitlines():
+                if re.match(r"\|\s*20\d{2}-\d{2}-\d{2}", line):
+                    parts = [p.strip() for p in line.strip().strip("|").split("|")]
+                    if len(parts) >= 2 and parts[-1] and parts[-1] != "-":
+                        try:
+                            metrics["forecast_peg_fy1"] = f"{float(parts[-1]):.4f}"
+                        except ValueError:
+                            pass
+                    break
+
         if metrics["debt_ratio"] != "N/A":
             match = re.search(r"([\d.]+)", metrics["debt_ratio"])
             if match:
@@ -1746,7 +1962,7 @@ def get_cn_hk_fundamentals(ticker: str) -> str:
             query_ticker = f"{ticker[2:]}.HK"
         else:
             query_ticker = ticker
-        r = subprocess.run(["python3.12", MX_DATA_SCRIPT, f"{query_ticker}近 4 期营业收入 销售毛利率 自由现金流 经营活动现金流"],
+        r = subprocess.run(["python3.12", _cfg.mx_data_script, f"{query_ticker}近 4 期营业收入 销售毛利率 自由现金流 经营活动现金流"],
                            capture_output=True, text=True, timeout=TIMEOUT_DATA)
         headers, lines = [], []
         KEY_FIELDS = ["营业收入", "销售毛利率", "经营活动产生的现金流量净额", "企业自由现金流量 FCFF"]
@@ -1779,7 +1995,7 @@ def save_to_investment_db(ticker: str, r, ta_decision: Optional[str], macro_scor
     """Save analysis result to local investment-db."""
     import sys
     try:
-        sys.path.insert(0, os.path.dirname(INVESTMENT_DB_SCRIPT))
+        sys.path.insert(0, _cfg.data_warehouse_script.parent)
         from data_warehouse import append_record
         d = r.dashboard if isinstance(r.dashboard, dict) else {}
         bp = d.get("battle_plan", {})
@@ -1810,7 +2026,7 @@ def save_to_notion(ticker: str, report_text: str):
         title = f"{ticker} 分析报告 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         result = subprocess.run(
             ["node", "scripts/md-to-notion.js", tmp_md, NOTION_INVEST_PAGE_ID, title, "--allow-unsafe-paths"],
-            capture_output=True, text=True, cwd=NOTION_SYNC_DIR,
+            capture_output=True, text=True, cwd=_cfg.notion_sync_dir,
             env={**os.environ, "NOTION_API_KEY": os.environ.get("NOTION_API_KEY", "")}
         )
         os.unlink(tmp_md)
@@ -1844,7 +2060,7 @@ def fetch_quarterly_data(ticker: str, market: str) -> dict:
 
         # Build env with MX_APIKEY
         env = dict(os.environ)
-        env_file = os.path.join(DAILY_ANALYSIS_DIR, ".env")
+        env_file = os.path.join(_cfg.daily_analysis_dir, ".env")
         try:
             with open(env_file) as f:
                 for line in f:
@@ -2075,7 +2291,7 @@ def fetch_revenue_composition(ticker: str, market: str, revenue_split: str = "")
 
     try:
         query_ticker = DataParser.to_query_ticker(ticker, market)
-        r = subprocess.run(["python3.12", MX_DATA_SCRIPT, f"{query_ticker} 营收构成 主营业务 国内 海外"],
+        r = subprocess.run(["python3.12", _cfg.mx_data_script, f"{query_ticker} 营收构成 主营业务 国内 海外"],
                            capture_output=True, text=True, timeout=TIMEOUT_DATA)
         headers = []
         for line in r.stdout.splitlines():

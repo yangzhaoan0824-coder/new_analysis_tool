@@ -18,7 +18,8 @@ from decimal import Decimal, getcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-from dual_engine.constants import VERSION, ENGINE_ID, TRADING_AGENTS_DIR
+from dual_engine.constants import VERSION, ENGINE_ID
+from dual_engine.config import get_config
 from dual_engine.exceptions import AnalysisError
 from dual_engine.utils import (
     log_error, clear_error_log, detect_market, parse_num, parse_num_float,
@@ -57,6 +58,12 @@ class EngineProcessor:
         self.market = detect_market(self.ticker)
         self.error_log: list[str] = []
         self._results: dict = {}
+        # Ensure trading-agents (macro_scorer) is on sys.path permanently
+        import sys as _sys
+        import os as _os
+        _ta_dir = str(get_config().trading_agents_dir)
+        if _ta_dir not in _sys.path and _os.path.isdir(_ta_dir):
+            _sys.path.insert(0, _ta_dir)
 
     def process(self) -> dict:
         """Run the full dual-engine analysis pipeline.
@@ -174,7 +181,7 @@ class EngineProcessor:
         try:
             # Add trading-agents directory to sys.path for macro_scorer import
             import sys as _sys
-            _ta_dir = TRADING_AGENTS_DIR
+            _ta_dir = get_config().trading_agents_dir
             if _ta_dir not in _sys.path and os.path.isdir(_ta_dir):
                 _sys.path.insert(0, _ta_dir)
             from macro_scorer import get_macro_score
@@ -392,7 +399,11 @@ class EngineProcessor:
                                                      company_profile.get('revenue_split', '') if company_profile else "")
 
         # ── Peer comparison ──
-        peers = fetch_peer_comparison(self.ticker, self.market, pe_ttm)
+        # 把行业标签（来自 company_profile.industry_sector）传给 peer 查询
+        industry_label = ""
+        if company_profile and company_profile.get("industry_sector"):
+            industry_label = company_profile["industry_sector"]
+        peers = fetch_peer_comparison(self.ticker, self.market, pe_ttm, industry_label)
 
         # Enrich current stock's peer entry with profit growth from earnings
         if earnings_forecast and earnings_forecast.get("profit_growth"):

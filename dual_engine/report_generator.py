@@ -162,11 +162,21 @@ class ReportGenerator:
 
         stock_name = r.name or ticker
 
-        # Business composition table
+        # Business composition table — prefer structured revenue_by_product
         revenue_comp = c["revenue_comp"]
         company_profile = self.results.get("company_profile") or {}
         biz_desc = company_profile.get('business', '')
-        if revenue_comp.get('by_product'):
+        by_product = company_profile.get('revenue_by_product') or []
+
+        if by_product:
+            rows = []
+            for item in by_product[:5]:
+                name = str(item.get('name', '业务'))[:22]
+                rev = str(item.get('revenue', 'N/A'))
+                pct = str(item.get('percent', 'N/A'))
+                rows.append(f"| {name:<22} │ {rev:>8} │ {pct:>6} |")
+            revenue_comp_table = "\n".join(rows)
+        elif revenue_comp.get('by_product'):
             rows = []
             for item in revenue_comp['by_product'][:5]:
                 name = item.get('name', '业务')
@@ -248,6 +258,10 @@ class ReportGenerator:
             macro_icon, macro_status = "⚪", "中性"
 
         macro_interp = f"{market_label}{price_change_display}，政策面与风险并存" if price_change_display != "N/A" else "政策面与风险并存"
+        # 若有 5日/区间涨跌幅则补充
+        change_5d = self.results.get("change_5d", "N/A")
+        if change_5d != "N/A":
+            macro_interp += f"，5日{change_5d}"
 
         # Sector
         sector_score = macro_score.sector if macro_score else None
@@ -496,15 +510,17 @@ class ReportGenerator:
 
         market_label = self.results["market_label"]
 
-        # Earnings table rows
+        # Earnings table rows — 取最近 3 年（保留历史 + 预测混合，最多 6 行中末 3 行）
         rows = []
         if earnings_forecast and earnings_forecast.get("years"):
-            revenue = earnings_forecast.get('revenue', ['N/A']*3)
-            profit = earnings_forecast.get('net_profit', ['N/A']*3)
-            profit_growth = earnings_forecast.get('profit_growth', ['N/A']*3)
-            eps_list = earnings_forecast.get('eps', ['N/A']*3)
-            years = earnings_forecast.get('years', ['2025A', '2026E', '2027E'])
-            for i, year in enumerate(years[:3]):
+            revenue = earnings_forecast.get('revenue', ['N/A']*6)
+            profit = earnings_forecast.get('net_profit', ['N/A']*6)
+            profit_growth = earnings_forecast.get('profit_growth', ['N/A']*6)
+            eps_list = earnings_forecast.get('eps', ['N/A']*6)
+            years = earnings_forecast.get("years", [])
+            # 优先取末 3 行（2025A + 2026E + 2027E 或 2026E/2027E/2028E）
+            display_years = years[-3:] if len(years) >= 3 else years
+            for i, year in zip(range(len(years) - len(display_years), len(years)), display_years):
                 status = "预测" if 'E' in year else "历史"
                 rv = revenue[i] if i < len(revenue) and revenue[i] != 'N/A' else 'N/A'
                 pv = profit[i] if i < len(profit) and profit[i] != 'N/A' else 'N/A'
@@ -712,16 +728,39 @@ class ReportGenerator:
         _customers = company_profile.get('key_customers', '') or ''
         customers_block = f"- **核心客户**：{_customers}" if _customers else ""
 
-        # Concept tags — prefer dynamic from mx-data, fallback to market-specific defaults
-        concept_tags_raw = self.results.get("concept_tags", "") or ""
-        if concept_tags_raw:
-            concept_tags = concept_tags_raw
-        elif market == "hk":
-            concept_tags = "仓储机器人 | AMR解决方案 | 智慧物流 | AI机器人 | 港股"
-        elif market == "us":
-            concept_tags = "科技股 | AI | 机器人 | 自动化"
-        else:
-            concept_tags = "机器人概念 | 汽车热管理 | 制冷空调 | 自动化"
+        # Concept tags — derive from revenue_by_product when available
+        concept_tags = ""
+        company_profile = self.results.get("company_profile") or {}
+        by_product = company_profile.get("revenue_by_product") or []
+        if by_product:
+            tag_set = []
+            for item in by_product[:4]:
+                name = str(item.get("name", "")).strip()
+                if name and name not in tag_set and name.lower() != "nan":
+                    tag_set.append(name)
+            # Add secondary tags based on industry/sector
+            sector = company_profile.get("industry_sector", "") or ""
+            biz_desc = company_profile.get("business", "") or ""
+            if "锂" in sector or "锂" in biz_desc:
+                for tag in ["锂矿", "锂盐", "新能源"]:
+                    if tag not in tag_set:
+                        tag_set.append(tag)
+                        if len(tag_set) >= 6:
+                            break
+            if "民爆" in sector or "民爆" in biz_desc:
+                for tag in ["民爆", "爆破工程"]:
+                    if tag not in tag_set:
+                        tag_set.append(tag)
+                        if len(tag_set) >= 6:
+                            break
+            concept_tags = " | ".join(tag_set[:6])
+        if not concept_tags:
+            if market == "hk":
+                concept_tags = "仓储机器人 | AMR解决方案 | 智慧物流 | AI机器人 | 港股"
+            elif market == "us":
+                concept_tags = "科技股 | AI | 机器人 | 自动化"
+            else:
+                concept_tags = "机器人 | 人工智能 | 智慧物流 | 自动化"
 
         return f"""📐 行业对标与估值
 
