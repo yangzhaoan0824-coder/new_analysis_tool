@@ -749,6 +749,10 @@ def _try_parse_mx_json(query_str: str, price_data: dict) -> None:
     if not path:
         return
 
+    # Extract ticker (6-digit code) from query_str for table filtering
+    ticker_match = re.search(r"(\d{6})", query_str or "")
+    ticker = ticker_match.group(1) if ticker_match else ""
+
     with open(path, encoding="utf-8") as f:
         raw = json.load(f)
 
@@ -765,10 +769,22 @@ def _try_parse_mx_json(query_str: str, price_data: dict) -> None:
     for tbl in tables:
         if not isinstance(tbl, dict):
             continue
+        # Prefer the table that contains 收盘价/总市值 (the "main" multi-metric table).
+        # mx-data returns auxiliary single-metric tables (e.g. 区间涨跌幅 alone) that
+        # would otherwise be processed first and leave the main fields as None.
+        tbl_code = tbl.get("code", "")
         name_map = tbl.get("nameMap", {})
         tbl_data = tbl.get("table", {})
         if not name_map or not isinstance(tbl_data, dict):
             continue
+        has_main_metric = any(
+            "收盘价" in str(v) or "总市值" in str(v) or "最新价" in str(v)
+            for v in name_map.values() if isinstance(v, str)
+        )
+        if not has_main_metric and len(tables) > 1:
+            continue  # skip auxiliary tables when main table exists
+        if tbl_code and not tbl_code.startswith(ticker) and not tbl_code.startswith(ticker[-6:]):
+            continue  # skip other-market tables (e.g. 02050.HK when querying 002050.SZ)
 
         # Determine the index of the latest date from headName/headNameSub
         head_names = tbl_data.get("headName") or tbl_data.get("headNameSub") or []
@@ -898,16 +914,22 @@ def _fetch_price_from_mx(query_ticker: str, market: str) -> Optional[dict]:
                                     elif ("市盈率" in col or "PE" in col.upper()) and price_data['pe'] is None:
                                         price_data['pe'] = val
 
-        # Fallback: read raw JSON file if price not found in stdout, OR if 5-day change is missing.
-        # 修复：mx-data 有时 raw JSON 在 stdout 输出后 1-2 秒才完整写入，
-        # 导致首次解析拿到 change_5d=None。最多重试 3 次，每次 sleep 0.6s。
-        if price_data['price'] is None or price_data['change_5d'] is None:
+        # Fallback: read raw JSON file if any important field is missing.
+        # mx-data stdout sometimes contains only the first table (e.g. 区间涨跌幅)
+        # and lacks 总市值/收盘价, while raw JSON has all tables.
+        if (price_data['price'] is None
+                or price_data['change_5d'] is None
+                or price_data['market_cap'] in (None, "N/A")
+                or price_data['change'] is None):
             import sys, time as _t
             for _attempt in range(3):
                 if _attempt > 0:
                     _t.sleep(0.6)
                 _try_parse_mx_json(query_str, price_data)
-                if price_data['price'] is not None and price_data['change_5d'] is not None:
+                if (price_data['price'] is not None
+                        and price_data['change_5d'] is not None
+                        and price_data['market_cap'] not in (None, "N/A")
+                        and price_data['change'] is not None):
                     break
 
         # If 5-day change still not available, compute from 区间涨跌幅
