@@ -1383,7 +1383,7 @@ def _supplement_historical_financials(query_ticker: str, forecast: dict, env: di
         for line in r.stdout.splitlines():
             if re.match(r"\|\s*date\s*\|", line, re.I):
                 headers = [p.strip() for p in line.strip().strip("|").split("|")]
-            elif re.match(r"\|\s*(20\d{2}|\d{4}[一三四中]", line):
+            elif re.match(r"\|\s*(20\d{2}|\d{4}[一-龥])", line):
                 parts = [p.strip() for p in line.strip().strip("|").split("|")]
                 if len(parts) < 2 or not headers:
                     continue
@@ -1913,9 +1913,139 @@ def fetch_gs_financial_metrics(ticker: str, market: str, price_data: dict = None
             if match:
                 debt_ratio = float(match.group(1)) / 100
                 metrics["net_debt_ebitda"] = f"{debt_ratio * 3:.1f}x"
+
+        # Fallback: try raw JSON if any key metric is still N/A.
+        # This handles cases where mx-data API is rate-limited and stdout is empty
+        # but a workspace cache file exists for the same query.
+        if (metrics["roe"] == "N/A"
+                or metrics["debt_ratio"] == "N/A"
+                or metrics["fcf"] == "N/A"
+                or metrics["beta"] == "N/A"
+                or metrics["forecast_pe_fy1"] == "N/A"):
+            try:
+                _try_parse_gs_metrics_json(query_ticker, metrics)
+            except Exception:
+                pass
     except Exception as e:
         log_error("gs_financial_metrics", str(e))
     return metrics
+
+
+def _try_parse_gs_metrics_json(query_ticker: str, metrics: dict) -> None:
+    """Fallback: parse mx-data raw JSON files for GS financial metrics.
+
+    Reads 3 workspace-cache JSON files (one per query in fetch_gs_financial_metrics):
+      1. 净资产收益率 ROE 自由现金流 资产负债率
+      2. Beta 系数 [市盈率]
+      3. 预测市盈率PE 历史PEG值
+
+    For each file, finds the matching table by nameMap and extracts the latest value
+    (or FY1 = first year row, depending on schema).
+    """
+    queries = [
+        f"{query_ticker} 净资产收益率 ROE 自由现金流 资产负债率",
+        f"{query_ticker} Beta 系数 市盈率",
+        f"{query_ticker} 预测市盈率PE 历史PEG值",
+    ]
+    for query_str in queries:
+        path = find_latest_raw_json(query_str, max_age=86400 * 30)
+        if not path:
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception:
+            continue
+        d = _navigate_mx_data_json(raw)
+        if not isinstance(d, dict):
+            continue
+        sr = d.get("searchDataResultDTO")
+        if not sr or not isinstance(sr, dict):
+            continue
+        tables = sr.get("dataTableDTOList", [])
+
+        for tbl in tables:
+            if not isinstance(tbl, dict):
+                continue
+            tbl_code = tbl.get("code", "")
+            # Prefer A-share (or HK for HK queries); skip the other market
+            if (tbl_code.endswith(".SZ") or tbl_code.endswith(".SS")) and not query_ticker.endswith((".SZ", ".SS")):
+                continue
+            if tbl_code.endswith(".HK") and not query_ticker.endswith(".HK"):
+                continue
+            name_map = tbl.get("nameMap", {})
+            tbl_data = tbl.get("table", {})
+            if not name_map or not isinstance(tbl_data, dict):
+                continue
+            head_names = tbl_data.get("headName") or []
+            if not head_names:
+                continue
+
+            def _get_first(col_names: list) -> str:
+                """Return first non-empty value from any matching nameMap column."""
+                for cn in col_names:
+                    for fk, fn in name_map.items():
+                        if fn == cn and fk in tbl_data:
+                            vals = tbl_data[fk]
+                            if isinstance(vals, list) and vals and vals[0]:
+                                return str(vals[0])
+                return ""
+
+            def _get_by_year(col_names: list, year: str) -> str:
+                """Return value of col at column index where headName == year."""
+                for cn in col_names:
+                    for fk, fn in name_map.items():
+                        if fn == cn and fk in tbl_data:
+                            vals = tbl_data[fk]
+                            if isinstance(vals, list) and year in head_names:
+                                idx = head_names.index(year)
+                                if idx < len(vals) and vals[idx]:
+                                    return str(vals[idx])
+                return ""
+
+            # ROE / FCF / Debt
+            if metrics["roe"] == "N/A":
+                v = _get_first(["净资产收益率ROE", "净资产收益率ROE(摊薄)(%)", "ROE"])
+                if v and v not in ("-", "N/A"):
+                    m = re.search(r"([\d.]+)", v)
+                    if m:
+                        metrics["roe"] = f"{float(m.group(1)):.2f}%" if "%" in v else f"{float(m.group(1)):.2f}%"
+            if metrics["fcf"] == "N/A":
+                v = _get_first(["企业自由现金流量FCFF(反推法)", "企业自由现金流量FCFF", "自由现金流", "FCF", "FCFF"])
+                if v and v not in ("-", "N/A"):
+                    metrics["fcf"] = v
+                    metrics["fcf_note"] = "(TTM)"
+
+            # Beta (only "beta值" or "Beta" columns; ignore 涨跌幅/Beta_系数 duplicates)
+            if metrics["beta"] == "N/A":
+                v = _get_first(["beta值(最近100周)", "Beta", "Beta系数", "β系数"])
+                if v and v not in ("-", "N/A"):
+                    m = re.search(r"([\d.]+)", v)
+                    if m:
+                        metrics["beta"] = m.group(1)
+
+            # Forward PE / PEG — FY1 = current year (2026 as of 2026-07)
+            if metrics["forecast_pe_fy1"] == "N/A":
+                v = _get_by_year(["预测市盈率PE(最新预测)(2026-05-22)", "预测市盈率PE(2026-05-22)",
+                                  "预测市盈率PE", "预测PE"], "2026")
+                if v and v not in ("-", "N/A"):
+                    metrics["forecast_pe_fy1"] = v
+            if metrics["forecast_pe_fy2"] == "N/A":
+                v = _get_by_year(["预测市盈率PE(最新预测)(2026-05-22)", "预测市盈率PE(2026-05-22)",
+                                  "预测市盈率PE", "预测PE"], "2027")
+                if v and v not in ("-", "N/A"):
+                    metrics["forecast_pe_fy2"] = v
+            if metrics["forecast_pe_fy3"] == "N/A":
+                v = _get_by_year(["预测市盈率PE(最新预测)(2026-05-22)", "预测市盈率PE(2026-05-22)",
+                                  "预测市盈率PE", "预测PE"], "2028")
+                if v and v not in ("-", "N/A"):
+                    metrics["forecast_pe_fy3"] = v
+            if metrics["forecast_peg_fy1"] == "N/A":
+                # PEG often appears as a separate column or in a separate table.
+                # First try the same table for a "预测PEG" column.
+                v = _get_by_year(["预测PEG", "预测PEG值", "PEG"], "2026")
+                if v and v not in ("-", "N/A"):
+                    metrics["forecast_peg_fy1"] = v
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
