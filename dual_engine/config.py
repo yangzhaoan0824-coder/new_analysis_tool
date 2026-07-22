@@ -9,6 +9,7 @@ Usage:
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -141,3 +142,90 @@ def reset_config() -> None:
     """Reset singleton (useful in tests)."""
     global _config
     _config = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Subprocess env helper — single source of truth for env-loading across
+# mx-data / mx-search / notion-sync subprocess invocations.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+#: Env keys that downstream skills (mx-data, mx-search, notion-sync) rely on.
+#: Loaded from <daily_analysis_dir>/.env first, then ~/.zshrc as fallback.
+_DEFAULT_SUBPROCESS_ENV_KEYS: tuple[str, ...] = (
+    "MX_APIKEY",
+    "MX_APIKEY_2",
+    "MX_APIKEY_3",
+    "FMP_API_KEY",
+    "NOTION_API_KEY",
+)
+
+
+def _read_kv_file(path) -> dict[str, str]:
+    """Parse a simple ``KEY=value`` file, ignoring comments and blanks.
+
+    Used for both ``.env`` and ``.zshrc`` style files.
+    """
+    if not path or not os.path.isfile(path):
+        return {}
+    out: dict[str, str] = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                # Accept both `KEY=value` and `export KEY=value`
+                m = re.match(
+                    r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[\"']?([^\"'\n#]*)[\"']?",
+                    s,
+                )
+                if m:
+                    key, val = m.group(1), m.group(2).strip()
+                    if key and val:
+                        out[key] = val
+    except OSError:
+        pass
+    return out
+
+
+def build_subprocess_env(
+    keys: tuple[str, ...] = _DEFAULT_SUBPROCESS_ENV_KEYS,
+    include_process_env: bool = True,
+) -> dict:
+    """Build a clean subprocess env dict for mx-data / mx-search / notion-sync.
+
+    Resolution priority (high → low, for each key):
+        1. Current ``os.environ`` (already loaded by host shell / load_dotenv)
+        2. ``<daily_analysis_dir>/.env`` (mx-data's own keys)
+        3. ``~/.zshrc`` (FMP / NOTION keys live here on macOS)
+
+    Args:
+        keys: Variable names to collect into the returned dict.
+        include_process_env: When True (default), the returned dict is a copy of
+            ``os.environ`` plus the key fallbacks above. When False, returns
+            only the resolved keys plus ``PATH``/``HOME``/``LANG`` so the
+            subprocess can boot.
+
+    Returns:
+        dict suitable for ``subprocess.run(..., env=env)``.
+    """
+    if include_process_env:
+        env = dict(os.environ)
+    else:
+        env = {
+            k: os.environ[k]
+            for k in ("PATH", "HOME", "LANG", "LC_ALL", "PYTHONIOENCODING")
+            if k in os.environ
+        }
+
+    fallback: dict[str, str] = {}
+    cfg = get_config()
+    fallback.update(_read_kv_file(cfg.daily_analysis_dir / ".env"))
+    fallback.update(_read_kv_file(Path(os.path.expanduser("~/.zshrc"))))
+
+    for k in keys:
+        if not env.get(k):
+            v = fallback.get(k)
+            if v:
+                env[k] = v
+    return env

@@ -18,7 +18,7 @@ from dual_engine.constants import (
     TIMEOUT_NEWS, TIMEOUT_DATA, TIMEOUT_ANALYSIS, TIMEOUT_FINANCIAL,
     NOTION_INVEST_PAGE_ID,
 )
-from dual_engine.config import get_config
+from dual_engine.config import get_config, build_subprocess_env
 
 _cfg = get_config()
 from dual_engine.utils import log_error, detect_market, _load_zshrc_env
@@ -84,17 +84,7 @@ def fetch_analyst_consensus(ticker: str, market: str) -> dict:
 
     # A/HK/fallback: single mx-data query for both target price and rating
     query_ticker = DataParser.to_query_ticker(ticker, market)
-    env = dict(os.environ)
-    env_file = os.path.join(_cfg.daily_analysis_dir, ".env")
-    try:
-        with open(env_file) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("MX_APIKEY") and "=" in line:
-                    k, v = line.split("=", 1)
-                    env[k.strip()] = v.strip()
-    except Exception:
-        pass
+    env = build_subprocess_env()
 
     try:
         query_str = f"{query_ticker} 目标价最高值 目标价最低值 目标价综合值 一致预期评级 机构评级"
@@ -1294,18 +1284,7 @@ def fetch_earnings_forecast(ticker: str, market: str) -> dict:
         query_ticker = DataParser.to_query_ticker(ticker, market)
         query_str = f"{query_ticker} 机构一致预期 2026 2027 2028"
 
-        # Build env with MX_APIKEY (load from .zshrc if missing)
-        env = dict(os.environ)
-        if not env.get("MX_APIKEY"):
-            try:
-                with open(os.path.expanduser("~/.zshrc")) as f:
-                    for line in f:
-                        m = re.match(r'^export\s+MX_APIKEY=["\']?([^"\'\n]+)', line)
-                        if m:
-                            env["MX_APIKEY"] = m.group(1)
-                            break
-            except Exception:
-                pass
+        env = build_subprocess_env()
 
         r = mx_data_cached(query_ticker, query_str, TTL_EARNINGS, env=env, timeout=TIMEOUT_DATA)
         headers = []
@@ -2386,18 +2365,7 @@ def fetch_quarterly_data(ticker: str, market: str) -> dict:
         query_ticker = DataParser.to_query_ticker(ticker, market)
         unit = "港元" if market == "hk" else "元"
 
-        # Build env with MX_APIKEY
-        env = dict(os.environ)
-        env_file = os.path.join(_cfg.daily_analysis_dir, ".env")
-        try:
-            with open(env_file) as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("MX_APIKEY") and "=" in line:
-                        k, v = line.split("=", 1)
-                        env[k.strip()] = v.strip()
-        except Exception:
-            pass
+        env = build_subprocess_env()
 
         r = mx_data_cached(
             query_ticker,
