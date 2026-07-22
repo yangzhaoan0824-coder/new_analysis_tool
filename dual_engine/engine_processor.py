@@ -65,6 +65,43 @@ class EngineProcessor:
         if _ta_dir not in _sys.path and _os.path.isdir(_ta_dir):
             _sys.path.insert(0, _ta_dir)
 
+    @staticmethod
+    def _apply_real_price_correction(
+        r,
+        real_price: float,
+        change: float | None,
+        currency: str,
+        log_tag: str,
+    ) -> None:
+        """Mutate ``r.dashboard`` so sniper points reflect the mx-data real-time price.
+
+        Sets:
+            battle_plan.sniper_points.{ideal_buy, stop_loss, take_profit}
+                to real_price × {0.98, 0.95, 1.05}
+            core_conclusion.one_sentence
+                to "当前价{real_price}{currency}，实时数据" (+ change% if present)
+            core_conclusion.time_sensitivity
+                to "实时"
+
+        Any failure is logged via ``log_error(log_tag, ...)`` and swallowed.
+        """
+        if not r or not hasattr(r, "dashboard"):
+            return
+        try:
+            d = r.dashboard if isinstance(r.dashboard, dict) else {}
+            bp = d.get("battle_plan", {})
+            sp = bp.get("sniper_points", {}) if isinstance(bp, dict) else {}
+            sp["ideal_buy"] = round(real_price * 0.98, 2)
+            sp["stop_loss"] = round(real_price * 0.95, 2)
+            sp["take_profit"] = round(real_price * 1.05, 2)
+            cc = d.get("core_conclusion", {})
+            cc["one_sentence"] = f"当前价{real_price}{currency}，实时数据"
+            cc["time_sensitivity"] = "实时"
+            if change is not None:
+                cc["one_sentence"] += f"，涨跌幅{change}%"
+        except Exception as e:
+            log_error(log_tag, f"修正失败：{e}")
+
     def process(self) -> dict:
         """Run the full dual-engine analysis pipeline.
 
@@ -86,45 +123,25 @@ class EngineProcessor:
         if self.market == "hk":
             print(f"   🔄 港股检测：使用 mx-data 获取实时价格...")
             hk_price_data = fetch_hk_price_from_mx(self.ticker)
-            if hk_price_data and hk_price_data.get('price') and r and hasattr(r, 'dashboard'):
+            if hk_price_data and hk_price_data.get('price'):
                 real_price = hk_price_data['price']
-                try:
-                    d = r.dashboard if isinstance(r.dashboard, dict) else {}
-                    bp = d.get("battle_plan", {})
-                    sp = bp.get("sniper_points", {}) if isinstance(bp, dict) else {}
-                    sp['ideal_buy'] = round(real_price * 0.98, 2)
-                    sp['stop_loss'] = round(real_price * 0.95, 2)
-                    sp['take_profit'] = round(real_price * 1.05, 2)
-                    cc = d.get("core_conclusion", {})
-                    cc['one_sentence'] = f'当前价{real_price}港元，实时数据'
-                    cc['time_sensitivity'] = '实时'
-                    if hk_price_data.get('change'):
-                        cc['one_sentence'] += f'，涨跌幅{hk_price_data["change"]}%'
-                    print(f"   ✅ 已使用 mx-data 实时价格修正：{real_price} 港元")
-                except Exception as e:
-                    log_error("hk-price-correction", f"修正失败：{e}")
+                self._apply_real_price_correction(
+                    r, real_price, hk_price_data.get('change'), "港元",
+                    "hk-price-correction",
+                )
+                print(f"   ✅ 已使用 mx-data 实时价格修正：{real_price} 港元")
 
         # A-share price correction
         elif self.market == "a":
             print(f"   🔄 A股检测：使用 mx-data 获取实时价格...")
             a_price_data = fetch_a_price_from_mx(self.ticker)
-            if a_price_data and a_price_data.get('price') and r and hasattr(r, 'dashboard'):
+            if a_price_data and a_price_data.get('price'):
                 real_price = a_price_data['price']
-                try:
-                    d = r.dashboard if isinstance(r.dashboard, dict) else {}
-                    bp = d.get("battle_plan", {})
-                    sp = bp.get("sniper_points", {}) if isinstance(bp, dict) else {}
-                    sp['ideal_buy'] = round(real_price * 0.98, 2)
-                    sp['stop_loss'] = round(real_price * 0.95, 2)
-                    sp['take_profit'] = round(real_price * 1.05, 2)
-                    cc = d.get("core_conclusion", {})
-                    cc['one_sentence'] = f'当前价{real_price}元，实时数据'
-                    cc['time_sensitivity'] = '实时'
-                    if a_price_data.get('change'):
-                        cc['one_sentence'] += f'，涨跌幅{a_price_data["change"]}%'
-                    print(f"   ✅ 已使用 mx-data 实时价格修正：{real_price} 元")
-                except Exception as e:
-                    log_error("a-price-correction", f"修正失败：{e}")
+                self._apply_real_price_correction(
+                    r, real_price, a_price_data.get('change'), "元",
+                    "a-price-correction",
+                )
+                print(f"   ✅ 已使用 mx-data 实时价格修正：{real_price} 元")
 
         if not r:
             raise AnalysisError("engine1", f"{self.ticker} daily_stock_analysis 失败")
