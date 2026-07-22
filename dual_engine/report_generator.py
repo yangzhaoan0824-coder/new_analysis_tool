@@ -130,6 +130,120 @@ class ReportGenerator:
             result += ch
         return result
 
+    # ── Helper: missing-data detection ────────────────────────────────────────
+
+    def _collect_missing_fields(self) -> list[dict]:
+        """Detect N/A fields caused by upstream data-source gaps (not algorithm faults).
+
+        Returns list of {field, label, source, impact}. Empty list = full data.
+        """
+        missing: list[dict] = []
+        c = self.composite
+        gs = c.get("gs_metrics") or {}
+        currency = "港元" if self.market == "hk" else "元"
+
+        # 1. 机构目标价
+        target = c.get("target_price_num")
+        consensus_rating = self.results.get("consensus_rating", "") or ""
+        analyst_target = self.results.get("analyst_target", "") or ""
+        if not target:
+            missing.append({
+                "field": "target_price",
+                "label": f"机构目标价均值",
+                "source": "mx-data 机构评级接口",
+                "impact": "上行空间 / 风险收益比 / 目标价位均无法计算",
+            })
+        if not consensus_rating or consensus_rating == "数据源限制":
+            missing.append({
+                "field": "consensus_rating",
+                "label": "综合评级（买入/增持等）",
+                "source": "mx-data 机构评级接口",
+                "impact": "一致预期评级缺失",
+            })
+        if not analyst_target:
+            missing.append({
+                "field": "analyst_target",
+                "label": "机构目标价详情",
+                "source": "mx-data 机构评级接口",
+                "impact": "无法展示具体目标价区间",
+            })
+
+        # 2. GS 财务指标字段
+        if gs.get("debt_ratio", "N/A") == "N/A":
+            missing.append({
+                "field": "debt_ratio",
+                "label": "资产负债率",
+                "source": "mx-data 财务预测表",
+                "impact": "杠杆水平评价缺失",
+            })
+        if gs.get("net_debt_ebitda", "N/A") == "N/A":
+            missing.append({
+                "field": "net_debt_ebitda",
+                "label": "净负债/EBITDA",
+                "source": "mx-data 财务预测表",
+                "impact": "偿债能力评价缺失",
+            })
+
+        # 3. 业务结构
+        company_profile = self.results.get("company_profile") or {}
+        rev_comp = c.get("revenue_comp") or {}
+        by_product = company_profile.get("revenue_by_product") or []
+        if not by_product and not rev_comp.get("by_product"):
+            missing.append({
+                "field": "revenue_by_product",
+                "label": "业务收入构成",
+                "source": "mx-data 公司画像接口",
+                "impact": "业务板块拆分不可用",
+            })
+
+        # 4. 财务预测期（历史 vs 预测）
+        forecast_keys = ["forecast_pe_fy1", "forecast_pe_fy2", "forecast_pe_fy3",
+                         "forecast_peg_fy1", "forecast_roe_fy1"]
+        if all(not gs.get(k) for k in forecast_keys):
+            missing.append({
+                "field": "forecast_metrics",
+                "label": "未来年度财务预测（FY1/FY2/FY3）",
+                "source": "mx-data 一致预期接口",
+                "impact": "前瞻估值全部缺失，仅看历史",
+            })
+
+        # 5. 实时行情/涨跌幅
+        price_change = self.results.get("price_change", "N/A")
+        change_5d = self.results.get("change_5d", "N/A")
+        if price_change == "N/A" and change_5d == "N/A":
+            missing.append({
+                "field": "price_changes",
+                "label": "实时涨跌幅 / 5日涨幅",
+                "source": "mx-data 实时行情接口",
+                "impact": "行情动量维度缺失",
+            })
+
+        return missing
+
+    def _build_missing_data_banner(self) -> str:
+        """Render compact missing-data info block (shown when upstream has gaps)."""
+        missing = self._collect_missing_fields()
+        if not missing:
+            return ""
+
+        lines = [
+            "⚠️ 数据源字段缺失提示",
+            "",
+            "本次分析中以下字段因上游数据源（mx-data）未返回而标记为 N/A，非算法问题：",
+            "",
+        ]
+        for i, m in enumerate(missing, 1):
+            lines.append(f"{i}. **{m['label']}** (`{m['field']}`)")
+            lines.append(f"   - 数据源：{m['source']}")
+            lines.append(f"   - 影响：{m['impact']}")
+
+        lines.extend([
+            "",
+            f"> 共检测到 {len(missing)} 项字段缺失，请结合实际可得数据审慎判断。",
+            "",
+        ])
+        return "\n".join(lines)
+
     # ── Header: title + operation table + business composition ─────────────────
 
     def _build_header(self) -> str:
@@ -189,11 +303,14 @@ class ReportGenerator:
         else:
             revenue_comp_table = "| 主营业务数据待完善            │    N/A   │    N/A   |"
 
+        missing_banner = self._build_missing_data_banner()
+        missing_section = (missing_banner + "\n") if missing_banner else ""
+
         return f"""📈 {stock_name} ({title_ticker}) 投资研究报告
 
 > 报告日期：{datetime.now().strftime('%Y年%m月%d日')} | 分析师：AI Analyst | 市场：{market_label} | 时效：本周内
 
-🎯 操作建议
+{missing_section}🎯 操作建议
 
 ┌─────────┬──────────┬──────────┬──────────┬────────────┐
 │  评级   │  当前价  │  目标价  │ 上行空间 │ 风险收益比 │
