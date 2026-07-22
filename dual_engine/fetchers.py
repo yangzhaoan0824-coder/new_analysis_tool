@@ -614,8 +614,22 @@ def run_daily_analysis(ticker: str):
         else:
             print(f"   ✅ 技术分由daily_stock_analysis计算：{result.sentiment_score}分")
 
-    if latest_tech_data:
+    # Always attach tech data to result — even if analyze_stock returned None
+    # (a None result means analyze_stock crashed, but latest_tech_data from mx-data
+    # was already successfully parsed and should still be available downstream)
+    if latest_tech_data and result is not None:
         result._latest_tech_data = latest_tech_data
+    elif latest_tech_data and result is None:
+        # result was None (analyze_stock crashed) but we still have valid tech data.
+        # Attach it to a minimal object so engine_processor can read it.
+        class _TechResult:
+            def __init__(self):
+                self._latest_tech_data = latest_tech_data
+                self.sentiment_score = 35
+                self.operation_advice = "持有"
+                self.dashboard = {}
+        result = _TechResult()
+        print(f"   ⚠️ daily_stock_analysis 异常退避，返回 mx-data 技术指标备用结果")
 
     # Restore original working directory and sys.path
     os.chdir(_orig_cwd)
@@ -1025,10 +1039,18 @@ def fetch_company_profile(ticker: str, market: str, price_data: dict = None) -> 
         if stdout2:
             sector = None
             for line in stdout2.splitlines():
+                # 兼容格式："| date | 行业 |" 或 "| date | 汽车 |"
                 m = re.search(r"\|\s*[\d-]+\s+\d{2}:\d{2}\s*\|\s*([^\|\n]+)\s*\|", line)
                 if m:
                     sector = m.group(1).strip()
                     break
+                # 也兼容只有 "汽车" 这种简单格式
+                m2 = re.search(r"\|\s*([^\|\s]+)\s*\|", line)
+                if m2 and not any(x in m2.group(1) for x in ["---", "date", "所属行业"]):
+                    val = m2.group(1).strip()
+                    if val and len(val) < 20:
+                        sector = val
+                        break
 
             # Parse 营收构成 JSON for "行业" row (锂行业/民爆 etc.) and product breakdown
             _try_parse_revenue_breakdown_json(f"{query_ticker} 营收构成 主营业务 国内 海外", profile)
@@ -1186,49 +1208,73 @@ def _try_parse_revenue_breakdown_json(query_str: str, profile: dict) -> None:
                 continue
 
             by_product = []
-            domestic_pct = None
-            overseas_pct = None
+            by_region = []
             industry_top = None
-            current_cat = ""  # 携带上一次的非空分类（mx-data 把同行延续的 category 标为空字符串）
 
-            for row_key, category_label in name_map.items():
-                if row_key in ("headNameSub", "headName"):
+            # ── name_map ROW-INDEX parsing ─────────────────────────────────────────────
+            # mx-data raw JSON for 营收构成 (confirmed via live test):
+            #
+            #   name_map:  {  '0': '产品',  '1': '',  '2': '',  '3': '',  '4': '',
+            #                 '5': '地区',  '6': '',  '7': '',  '8': '',  '9': '', ... }
+            #   tbl_data:  {  'headName': ['主营构成', '营业收入(元)', '收入构成', '币种'],
+            #                 '0': ['主营构成',  '45.84亿',  '100.00%',  'USD'],  ← row 0
+            #                 '1': ['电动助力转向(EPS)', '31.29亿', '68.25%', 'USD'], ← row 1
+            #                 '2': ['动力传动系统(DL)',  '8.098亿',  '17.66%',  'USD'], ← row 2
+            #                 ...
+            #                 '5': ['合计',  '45.84亿',  '100.00%',  'USD'],  ← row 5 (地区 section)
+            #                 '6': ['北美洲', '22.9亿',   '49.96%',  'USD'],  ← row 6
+            #                 '7': ['亚太区', '14.69亿',  '32.04%',  'USD'],  ← row 7
+            #                 '8': ['欧洲、中东...', '7.989亿', '17.43%', 'USD'], ← row 8
+            #               }
+            #
+            # The row index (key in name_map) tells us the row category.
+            # tbl_data[key] = [item_name, revenue, pct, currency] for that row.
+            #
+            # Approach: iterate through name_map row-by-row.
+            # Non-empty name_map value marks a section header.
+            # '产品' → product section; '地区' → region section.
+            # Read tbl_data[key] to get [item_name, revenue, pct, currency] for each data row.
+            #
+            row_keys = [k for k in sorted(name_map, key=lambda x: int(x) if x.isdigit() else 9999)
+                        if k not in ("headNameSub", "headName")]
+            if not row_keys:
+                continue
+
+            current_section = ""
+            for key in row_keys:
+                section_label = str(name_map.get(key, "")).strip()
+                if section_label in ("产品", "地区", "行业"):
+                    current_section = section_label
+                    continue  # skip the section header row (e.g. '合计' row)
+
+                row_vals = tbl_data.get(key, [])
+                if not isinstance(row_vals, list) or len(row_vals) < 2:
                     continue
-                row_vals = tbl_data.get(row_key)
-                if not isinstance(row_vals, list) or len(row_vals) < 3:
+
+                item = str(row_vals[0]).strip()
+                if not item or item in ("合计", "-", "N/A", ""):
                     continue
-                item_name = str(row_vals[0]).strip()
-                revenue = str(row_vals[1]).strip() if len(row_vals) > 1 else "N/A"
+
                 pct_raw = str(row_vals[2]).strip() if len(row_vals) > 2 else "N/A"
-                # 占比可能是 "56.46%" 或 "-"
-                pct = pct_raw if "%" in pct_raw else (pct_raw + "%" if pct_raw not in ("-", "N/A", "") else "N/A")
+                pct = pct_raw if "%" in pct_raw else ("N/A" if pct_raw in ("-", "") else pct_raw)
+                rev = str(row_vals[1]).strip() if len(row_vals) > 1 else "N/A"
 
-                # category_label 可能是 "行业"/"产品"/"地区"，也可能是空（mx-data 对延续行标空字符串）
-                cat = str(category_label).strip() if category_label else ""
-                if cat:
-                    current_cat = cat
-                # 使用 current_cat（含延续行），忽略 "销售模式"
-                effective_cat = current_cat if cat in ("", "行业", "产品", "地区") else cat
-
-                if effective_cat == "产品":
-                    by_product.append({"name": item_name, "revenue": revenue, "percent": pct})
-                elif effective_cat == "地区":
-                    if "中国" in item_name or "大陆" in item_name or "境内" in item_name:
-                        domestic_pct = pct
-                    elif "国外" in item_name or "海外" in item_name or "境外" in item_name:
-                        overseas_pct = pct
-                elif effective_cat == "行业" and industry_top is None:
-                    industry_top = item_name
+                if current_section == "产品":
+                    by_product.append({"name": item, "revenue": rev, "percent": pct})
+                elif current_section == "地区":
+                    by_region.append((item, pct))
+                elif current_section == "行业" and industry_top is None:
+                    industry_top = item
 
             if industry_top and not profile.get("industry_sector"):
                 profile["industry_sector"] = industry_top
 
             if by_product:
                 profile["revenue_by_product"] = by_product
-            if domestic_pct or overseas_pct:
-                profile["revenue_split"] = (
-                    f"国内 {domestic_pct or 'N/A'} | 海外 {overseas_pct or 'N/A'}"
-                )
+            # Build human-readable split: "北美洲 49.96% | 亚太区 32.04% | 欧洲、中东、非洲及南美洲 17.43%"
+            if by_region:
+                parts = [f"{name} {pct}" for name, pct in by_region]
+                profile["revenue_split"] = " | ".join(parts)
             return
     except Exception:
         pass
@@ -1332,12 +1378,21 @@ def fetch_earnings_forecast(ticker: str, market: str) -> dict:
         # 修复：即使已有历史年，仍调用 JSON 来补全预测年数据
         _try_parse_earnings_json(query_str, forecast)
 
-        # ── Supplement: if revenue/profit/EPS still N/A, query historical financials ──
-        has_nas = any(v == "N/A" for v in forecast.get("revenue", [])[:1]) \
-                  or any(v == "N/A" for v in forecast.get("net_profit", [])[:1]) \
-                  or any(v == "N/A" for v in forecast.get("eps", [])[:1])
-        if has_nas:
-            _supplement_historical_financials(query_ticker, forecast, env)
+        # ── Supplement: trigger on ANY missing financial field, not just revenue[0] ──
+        # For HK stocks like 01316.HK, revenue may be populated but forecast_roe_fy1
+        # (and PE/FY1/PE/FY2) are still N/A — the original has_nas check misses these.
+        needs_supplement = (
+            forecast["forecast_roe_fy1"] == "N/A"
+            or forecast["forecast_pe_fy1"] == "N/A"
+            or forecast["forecast_peg_fy1"] == "N/A"
+            or any(v == "N/A" for v in forecast.get("revenue", [])[:1])
+            or any(v == "N/A" for v in forecast.get("net_profit", [])[:1])
+            or any(v == "N/A" for v in forecast.get("eps", [])[:1])
+            or any(v == "N/A" for v in forecast.get("profit_growth", []))
+        )
+        if needs_supplement:
+            supp_query = f"{query_ticker} 营业总收入 归母净利润 EPS 毛利率 利润同比增长率 PE PEG ROE"
+            _supplement_from_json_cache(supp_query, forecast)
 
         if not forecast["years"]:
             forecast = DataParser.structure_earnings_forecast(forecast)
@@ -1366,7 +1421,120 @@ def _strip_unit(val: str) -> str:
     return val
 
 
-def _supplement_historical_financials(query_ticker: str, forecast: dict, env: dict) -> None:
+def _supplement_from_json_cache(query_str: str, forecast: dict) -> None:
+    """Fallback: read mx-data raw JSON cache to supplement forecast fields.
+
+    When mx-data API is unavailable (empty stdout), this function reads the
+    most recent workspace cache file and extracts any available financial data.
+    Works for both consensus (年 营收 净利 EPS) and historical (季度 营收 净利 ROE).
+    """
+    path = find_latest_raw_json(query_str, max_age=86400 * 30)
+    if not path:
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+        d = _navigate_mx_data_json(raw)
+        if not isinstance(d, dict):
+            return
+        sr = d.get("searchDataResultDTO")
+        if not sr or not isinstance(sr, dict):
+            return
+        tables = sr.get("dataTableDTOList", [])
+        for tbl in tables:
+            if not isinstance(tbl, dict):
+                continue
+            tbl_data = tbl.get("table", {})
+            name_map = tbl.get("nameMap", {})
+            if not name_map or not isinstance(tbl_data, dict):
+                continue
+            head_names = tbl_data.get("headName") or []
+            if not head_names:
+                continue
+
+            # ── Case 1: quarterly format (headName = ['2025年报', '2025中报', ...])
+            # Confirmed structure (01316.HK):
+            #   name_map:  {'100000000046902': '净资产收益率(平均)(%)', ...}
+            #   tbl_data:  {'100000000046902': ['4.987', '3.138', '3.131', '0.8024'],  ← first = latest
+            #              'headName': ['2025年报', '2025中报', '2024年报', '2024中报']}
+            #
+            # Approach: iterate name_map (key → metric_name). Use key to get time-series
+            # values from tbl_data. First element = latest period (2025年报).
+            first_head = str(head_names[0]) if head_names else ""
+            if any(q in first_head for q in ["一季报", "中报", "三季报", "年报"]):
+                for key, metric_name in name_map.items():
+                    if key in ("headName", "headNameSub"):
+                        continue
+                    col_vals = tbl_data.get(key, [])
+                    if not isinstance(col_vals, list) or len(col_vals) < 2:
+                        continue
+                    # col_vals[0] = latest period value, col_vals[1] = next, etc.
+                    val_raw = str(col_vals[0]).strip() if col_vals[0] else ""
+                    if not val_raw or val_raw in ("-", "N/A", ""):
+                        continue
+
+                    if any(k in metric_name for k in ["ROE", "净资产收益率"]) and forecast["forecast_roe_fy1"] == "N/A":
+                        m = re.search(r"([\d.]+)", val_raw)
+                        if m:
+                            forecast["forecast_roe_fy1"] = f"{float(m.group(1)):.2f}%"
+
+                    # Revenue
+                    elif any(k in metric_name for k in ["营业总收入", "营业收入"]) and not forecast.get("revenue"):
+                        m = re.search(r"([\-\d.]+)", val_raw)
+                        if m:
+                            val = float(m.group(1))
+                            unit = "亿" if abs(val) >= 1 else ("万" if abs(val) >= 0.001 else "")
+                            forecast["years"] = [first_head[:4]]
+                            forecast["revenue"] = [f"{val:.1f}{unit}港元"]
+
+                    # Net profit (exclude % columns like "净利润同比增长率")
+                    elif any(k in metric_name for k in ["归母净利润", "归属于母公司股东的净利润"]) and "(%)" not in metric_name and not forecast.get("net_profit"):
+                        m = re.search(r"([\-\d.]+)", val_raw)
+                        if m:
+                            val = float(m.group(1))
+                            unit = "亿" if abs(val) >= 1 else ("万" if abs(val) >= 0.001 else "")
+                            forecast["net_profit"] = [f"{val:.2f}{unit}港元"]
+
+                    # Revenue growth (e.g. "营业总收入同比增长率")
+                    elif "营业总收入" in metric_name and "增长率" in metric_name and not forecast.get("revenue_growth"):
+                        m = re.search(r"([\-\d.]+)", val_raw)
+                        if m:
+                            forecast["revenue_growth"] = [f"{m.group(1)}%"]
+
+                    # Profit growth: 净利润同比增长率 OR 归属母公司股东净利润同比增长率
+                    elif any(k in metric_name for k in ["净利润同比增长率", "归属母公司股东净利润同比增长率", "利润同比增长率", "归母净利润增长率"]) and not forecast.get("profit_growth"):
+                        m = re.search(r"([\-\d.]+)", val_raw)
+                        if m:
+                            forecast["profit_growth"] = [f"{m.group(1)}%"]
+
+            # ── Case 2: year-column format (headName = ['2026', '2027', ...])
+            # name_map: {'metric_id': 'Metric Display Name', ...}
+            # tbl_data: {'metric_id': [metric_name, fy1_val, fy2_val, fy3_val], ...}
+            elif re.match(r"20\d{2}", first_head):
+                for key, metric_name in name_map.items():
+                    if key in ("headName", "headNameSub"):
+                        continue
+                    col_vals = tbl_data.get(key, [])
+                    if not isinstance(col_vals, list) or len(col_vals) < 2:
+                        continue
+                    metric_name = str(col_vals[0]).strip()
+                    if not metric_name:
+                        continue
+                    # FY1 = col_vals[1], FY2 = col_vals[2], FY3 = col_vals[3]
+                    for fy_idx, fy_name in [(1, "pe_fy1"), (2, "pe_fy2"), (3, "pe_fy3")]:
+                        val_raw = str(col_vals[fy_idx]).strip() if len(col_vals) > fy_idx else ""
+                        if not val_raw or val_raw in ("-", "N/A", ""):
+                            continue
+                        if any(k in metric_name for k in ["PE", "市盈率"]) and "TTM" not in metric_name:
+                            if forecast["forecast_pe_fy1"] == "N/A":
+                                m = re.search(r"([\d.]+)", val_raw)
+                                if m: forecast["forecast_pe_fy1"] = m.group(1)
+                        elif "PEG" in metric_name:
+                            if forecast["forecast_peg_fy1"] == "N/A":
+                                m = re.search(r"([\d.]+)", val_raw)
+                                if m: forecast["forecast_peg_fy1"] = m.group(1)
+    except Exception:
+        pass
     """Supplement earnings forecast with historical financial data from mx-data.
 
     When the consensus query returns N/A for revenue/profit/EPS, this function
@@ -1377,6 +1545,9 @@ def _supplement_historical_financials(query_ticker: str, forecast: dict, env: di
     try:
         supp_query = f"{query_ticker} 营业总收入 归母净利润 EPS 毛利率 利润同比增长率 PE PEG ROE"
         r = mx_data_cached(query_ticker, supp_query, TTL_EARNINGS, env=env, timeout=TIMEOUT_DATA)
+        if not r or not r.stdout.strip():
+            _supplement_from_json_cache(supp_query, forecast)
+            return
 
         headers = []
         rows_parsed = 0
@@ -1394,9 +1565,25 @@ def _supplement_historical_financials(query_ticker: str, forecast: dict, env: di
                         row_dict[col] = parts[i]
 
                 year = parts[0]
-                # Skip if already filled from consensus
-                if year in forecast["years"]:
-                    idx = forecast["years"].index(year)
+                # Extract year from date strings like "2026-12-31" or "2026年12月31日"
+                m_year = re.match(r"(20\d{2})", year)
+                year_key = m_year.group(1) if m_year else year
+
+                # Update forward metrics for any matched row (even if year already in forecast)
+                # These are often in a separate table section with year columns not matching forecast["years"]
+                pe_val = row_dict.get("PE") or row_dict.get("市盈率")
+                peg_val = row_dict.get("PEG") or row_dict.get("历史PEG值")
+                roe_val = row_dict.get("ROE") or row_dict.get("ROE(%)")
+                if pe_val and pe_val != "-" and forecast["forecast_pe_fy1"] == "N/A":
+                    forecast["forecast_pe_fy1"] = pe_val
+                if peg_val and peg_val != "-" and forecast["forecast_peg_fy1"] == "N/A":
+                    forecast["forecast_peg_fy1"] = peg_val
+                if roe_val and roe_val != "-" and forecast["forecast_roe_fy1"] == "N/A":
+                    forecast["forecast_roe_fy1"] = roe_val + "%" if "%" not in roe_val else roe_val
+
+                # Skip if year already filled from consensus
+                if year_key in forecast["years"]:
+                    idx = forecast["years"].index(year_key)
                     # Only fill N/A slots
                     if idx < len(forecast["revenue"]) and forecast["revenue"][idx] == "N/A":
                         rev = _strip_unit(row_dict.get("营业总收入") or row_dict.get("营业收入"))
@@ -1431,29 +1618,18 @@ def _supplement_historical_financials(query_ticker: str, forecast: dict, env: di
                     m = re.search(r"([\-\d.]+)", rg_raw)
                     if m: revenue_growth_val = m.group(1) + "%"
 
-                forecast["years"].append(year)
+                forecast["years"].append(year_key)
                 forecast["revenue"].append(rev if rev and rev != "-" else "N/A")
                 forecast["revenue_growth"].append(revenue_growth_val or "N/A")
                 forecast["net_profit"].append(np_val if np_val and np_val != "-" else "N/A")
                 forecast["profit_growth"].append(profit_growth_val or "N/A")
                 forecast["eps"].append(eps_val if eps_val and eps_val != "-" else "N/A")
 
-                # Fill forward metrics if still N/A
-                pe_val = row_dict.get("PE") or row_dict.get("市盈率")
-                peg_val = row_dict.get("PEG") or row_dict.get("历史PEG值")
-                roe_val = row_dict.get("ROE") or row_dict.get("ROE(%)")
-                if pe_val and pe_val != "-" and forecast["forecast_pe_fy1"] == "N/A":
-                    forecast["forecast_pe_fy1"] = pe_val
-                if peg_val and peg_val != "-" and forecast["forecast_peg_fy1"] == "N/A":
-                    forecast["forecast_peg_fy1"] = peg_val
-                if roe_val and roe_val != "-" and forecast["forecast_roe_fy1"] == "N/A":
-                    forecast["forecast_roe_fy1"] = roe_val + "%" if "%" not in roe_val else roe_val
-
                 rows_parsed += 1
                 if rows_parsed >= 3 or len(forecast["years"]) >= 3:
                     break
-    except Exception as e:
-        log_error("supplement_historical", str(e))
+    except Exception:
+        pass
 
 
 def _try_parse_earnings_json(query_str: str, forecast: dict, max_age: int = 86400) -> None:
