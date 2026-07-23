@@ -637,16 +637,19 @@ class ReportGenerator:
             years = earnings_forecast.get("years", [])
             # 优先取末 3 行（2025A + 2026E + 2027E 或 2026E/2027E/2028E）
             display_years = years[-3:] if len(years) >= 3 else years
+            gm_raw = earnings_forecast.get("gross_margin", "N/A")
+            gm_val = gm_raw if gm_raw != "N/A" else "N/A"
             for i, year in zip(range(len(years) - len(display_years), len(years)), display_years):
                 status = "预测" if 'E' in year else "历史"
                 rv = revenue[i] if i < len(revenue) and revenue[i] != 'N/A' else 'N/A'
                 pv = profit[i] if i < len(profit) and profit[i] != 'N/A' else 'N/A'
                 ev = eps_list[i] if i < len(eps_list) and eps_list[i] != 'N/A' else 'N/A'
                 gv = profit_growth[i] if i < len(profit_growth) and profit_growth[i] != 'N/A' else 'N/A'
-                rows.append(f"│ {year}  │   {status}   │ {rv:>8} │ {pv:>8} │     N/A ✅     │  N/A   │ {ev:>6} │ {gv:>8} │")
+                gm_cell = gm_val if gm_val != 'N/A' else 'N/A'
+                rows.append(f"│ {year}  │   {status}   │ {rv:>8} │ {pv:>8} │     N/A ✅     │ {gm_cell:>6} │ {ev:>6} │ {gv:>8} │")
         else:
             for year, status in [("2025A", "历史"), ("2026E", "预测"), ("2027E", "预测")]:
-                rows.append(f"│ {year}  │   {status}   │      N/A │      N/A │     N/A ✅     │  N/A   │    N/A │      N/A │")
+                rows.append(f"│ {year}  │   {status}   │      N/A │      N/A │     N/A ✅     │    N/A │    N/A │      N/A │")
 
         # FCF footnote
         ocf = gs_metrics.get('operating_cashflow', 'N/A')
@@ -675,6 +678,7 @@ class ReportGenerator:
         q_np = qdata.get("net_profit_q")
         q_rev_yoy = qdata.get("revenue_yoy_q")
         q_np_yoy = qdata.get("net_profit_yoy_q")
+        q_gm = qdata.get("gross_margin") or self.results.get("gross_margin") or "N/A"
 
         def _qdisp(val: str | None) -> str:
             return f"{val} 亿元" if val else "N/A"
@@ -684,7 +688,8 @@ class ReportGenerator:
 
         quarterly_rows = (
             f"│ 营收         │ {_qdisp(q_rev):>8} │ {_qoyd(q_rev_yoy):>8} │\n"
-            f"│ 归母净利润   │ {_qdisp(q_np):>8} │ {_qoyd(q_np_yoy):>8} │"
+            f"│ 归母净利润   │ {_qdisp(q_np):>8} │ {_qoyd(q_np_yoy):>8} │\n"
+            f"│ 毛利率       │      {q_gm:>6} │      N/A   │"
         )
 
         return f"""📊 财务预测与核心指标 (GS Data)

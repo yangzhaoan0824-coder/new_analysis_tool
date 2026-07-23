@@ -296,6 +296,14 @@ class EngineProcessor:
             news_text, ta_decision, consensus_rating, _price_data_for_dedup
         )
 
+        # Inject gross_margin from revenue_comp or earnings_forecast into quarterly_data
+        revenue_comp = composite_result.get("revenue_comp", {}) if composite_result else {}
+        gm_source = quarterly_data.get("gross_margin") \
+            or revenue_comp.get("gross_margin") \
+            or (earnings_forecast.get("gross_margin") if earnings_forecast else None)
+        if gm_source and not quarterly_data.get("gross_margin"):
+            quarterly_data["gross_margin"] = gm_source
+
         # ═══ Assemble all results ═══
         self._results = {
             "ticker": self.ticker,
