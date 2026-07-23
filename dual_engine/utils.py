@@ -35,6 +35,8 @@ def detect_market(ticker: str) -> str:
 
     - HK prefix + digits (e.g. HK08379) → 'hk'
     - .HK suffix (e.g. 08379.HK) → 'hk'
+    - 5-digit prefix + .HK (e.g. 00800.HK) → 'hk'
+    - 6-digit prefix + .SH / .SZ (e.g. 600519.SH, 002497.SZ) → 'a'
     - Pure 6-digit number (e.g. 002050) → 'a'
     - Otherwise → 'us'
     """
@@ -43,6 +45,8 @@ def detect_market(ticker: str) -> str:
         return MARKET_HK
     if t.endswith(".HK"):
         return MARKET_HK
+    if t.endswith(".SZ") or t.endswith(".SH"):
+        return MARKET_A
     if t.isdigit() and len(t) == 6:
         return MARKET_A
     return MARKET_US
